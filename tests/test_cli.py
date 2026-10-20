@@ -4,7 +4,7 @@ from datetime import datetime
 from conftest import FakeRunner, git, remote_head
 from test_github import pr, repo_line, status_payload
 
-from syncghrepo import cli, save
+from syncghrepo import cli, dash, local, save
 from syncghrepo.run import Result
 
 WIP = f"wip/{datetime.now().astimezone().strftime('%Y%m%d')}-{save.host_tag()}"
@@ -97,6 +97,9 @@ def test_apply_saves_syncs_pushes_and_summarizes(tmp_path, origin, clone, capsys
     assert "Clones: 1 updated" in out
     assert "Saved: 1 file(s), 0 held back" in out
     assert "Done:" in out and "ok git-sync  # In sync, all fine." in out
+    config = dash.config_dir() / "config.yml"
+    assert f"gh-dash config: Wrote {local.short_path(config)}; review with: gh dash\n" in out
+    assert "assignee:@me repo:benpshore/other repo:benpshore/proj" in config.read_text()
     assert "CI failure on main (abcdef1)" in out
     assert "Not cloned, nothing open (1): benpshore/other" in out
 
@@ -155,6 +158,62 @@ def test_no_github_flag_makes_no_gh_calls(tmp_path, clone, capsys):
     report = json.loads(capsys.readouterr().out)
     assert report["user"] is None
     assert all(cmd[0] == "git" for cmd in runner.calls)
+
+
+def test_dry_run_writes_no_gh_dash_config(tmp_path, origin, clone, capsys):
+    point_origin_at_github(clone)
+    runner = FakeRunner(gh_replies())
+    cli.main(["--root", str(tmp_path / "code"), "--json"], runner=runner)
+    report = json.loads(capsys.readouterr().out)
+    target = dash.config_dir() / "config.yml"
+    assert report["gh_dash"] == {"path": str(target), "written": False, "existing_config": False}
+    assert not target.exists() and not target.parent.exists()
+    assert report["ghq_clones"] is None  # --root: exactly these roots, no ghq
+    assert not any(c[0] == "ghq" for c in runner.calls)
+
+
+def test_gh_dash_config_never_overwrites_yours(tmp_path, origin, clone, capsys):
+    point_origin_at_github(clone)
+    mine = dash.config_dir() / "config.yml"
+    mine.parent.mkdir(parents=True)
+    mine.write_text("prSections: []\n")
+    args = ["--root", str(tmp_path / "code"), "--apply", "--json"]
+    cli.main(args, runner=FakeRunner(gh_replies()))
+    report = json.loads(capsys.readouterr().out)
+    assert mine.read_text() == "prSections: []\n"
+    written = mine.with_name("config.syncghrepo.yml")
+    assert report["gh_dash"] == {"path": str(written), "written": True, "existing_config": True}
+    text = written.read_text()
+    scope = " repo:benpshore/other repo:benpshore/proj"
+    for title, filters in [*dash.PR_SECTIONS, *dash.ISSUE_SECTIONS]:
+        assert f'  - title: "{title}"\n    filters: "{filters}{scope}"\n' in text
+    assert f'repoPaths:\n  "benpshore/proj": "{local.short_path(clone.resolve())}"\n' in text
+    assert text.endswith("defaults:\n  view: prs\n")
+
+
+def test_ghq_clones_are_a_clone_source_without_root(tmp_path, origin, clone, monkeypatch, capsys):
+    monkeypatch.setenv("SYNCGHREPO_ROOTS", str(tmp_path / "code"))
+    managed = tmp_path / "ghq" / "github.com" / "benpshore" / "proj"
+    git(tmp_path, "clone", "-q", str(origin.bare), str(managed))
+    listing = f"{managed}\n{clone}\n{tmp_path / 'ghq' / 'gone'}\n"  # dupes and stale entries
+    runner = FakeRunner(ghq=Result(0, listing))
+    assert cli.main(["--no-github", "--json"], runner=runner) == 0
+    report = json.loads(capsys.readouterr().out)
+    assert report["ghq_clones"] == 2
+    paths = sorted(c["path"] for r in report["repos"] for c in r["clones"])
+    assert paths == sorted([str(managed.resolve()), str(clone.resolve())])
+    assert ["ghq", "list", "-p"] in runner.calls
+    assert report["gh_dash"] is None  # no GitHub, no review config
+
+
+def test_ghq_missing_or_failing(tmp_path, clone, monkeypatch, capsys):
+    monkeypatch.setenv("SYNCGHREPO_ROOTS", str(tmp_path / "code"))
+    missing = FakeRunner(ghq=Result(127, "", "ghq: No such file or directory"))
+    assert cli.main(["--no-github", "--json"], runner=missing) == 0
+    assert json.loads(capsys.readouterr().out)["ghq_clones"] is None
+    broken = FakeRunner(ghq=Result(1, "", "boom"))
+    assert cli.main(["--no-github", "--json"], runner=broken) == 1
+    assert json.loads(capsys.readouterr().out)["errors"] == ["ghq list -p failed: boom"]
 
 
 def test_mode_flags():

@@ -19,7 +19,8 @@ from syncghrepo.run import Result
 
 SCHEMA_VERSION = 1
 TOP = {"schema_version", "tool", "version", "generated_at", "user", "dry_run", "roots",
-       "summary", "items", "repos", "errors"}  # fmt: skip
+       "ghq_clones", "gh_dash", "summary", "items", "repos", "errors"}  # fmt: skip
+GH_DASH = {"path", "written", "existing_config"}
 SUMMARY = {
     "repos", "on_github", "cloned", "not_cloned", "clones", "clone_status", "saved_files",
     "held_back_files", "auto_resolved", "conflicts", "open_prs", "draft_prs",
@@ -99,6 +100,7 @@ def test_json_schema_is_stable(tmp_path, origin, clone, capsys):
     assert report["schema_version"] == cli.SCHEMA_VERSION == SCHEMA_VERSION
     assert set(report) == TOP
     assert set(report["summary"]) == SUMMARY
+    assert set(report["gh_dash"]) == GH_DASH
     (repo,) = report["repos"]
     assert set(repo) == REPO
     assert set(repo["remote"]) == REMOTE
@@ -143,5 +145,5 @@ def test_readme_documents_every_field_and_kind():
     assert f"schema_version` is `{SCHEMA_VERSION}`" in section
     documented = set(re.findall(r"`([a-z_]+)`", section))
     fields = (TOP | SUMMARY | ITEM | KINDS | REPO | REMOTE | PR | ISSUE | CLONE | BRANCH
-              | STASH | ACTION | GIT_SYNC_RUN | SAVED | HELD | CONFLICT)  # fmt: skip
+              | STASH | ACTION | GIT_SYNC_RUN | SAVED | HELD | CONFLICT | GH_DASH)  # fmt: skip
     assert sorted(fields - documented) == []

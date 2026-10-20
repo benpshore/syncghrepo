@@ -1,5 +1,6 @@
 """Test helpers. No test touches the network: git only talks to bare repos in
-tmp_path, and gh and lockfile tools are always fakes that answer from canned replies."""
+tmp_path, and gh, ghq and lockfile tools are always fakes that answer from canned
+replies (git-sync is the real script, from tests/fixtures)."""
 
 import os
 import subprocess
@@ -21,6 +22,7 @@ def isolated_git(tmp_path_factory, monkeypatch):
     monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(cfg))
     monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
     monkeypatch.setenv("SYNCGHREPO_GIT_SYNC", str(GIT_SYNC))
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path_factory.mktemp("xdg")))  # gh-dash config
     for role in ("AUTHOR", "COMMITTER"):
         monkeypatch.setenv(f"GIT_{role}_NAME", "Test User")
         monkeypatch.setenv(f"GIT_{role}_EMAIL", "test@example.com")
@@ -35,15 +37,22 @@ class FakeRunner:
     the test, so nothing reaches GitHub or a package index.
     """
 
-    def __init__(self, gh: dict | None = None, tools: dict | None = None, git_hook=None):
+    def __init__(
+        self, gh: dict | None = None, tools: dict | None = None, git_hook=None,
+        ghq: Result | None = None,
+    ):  # fmt: skip
         self.gh = gh or {}
         self.tools = tools or {}
         self.git_hook = git_hook
+        self.ghq = ghq or Result(0, "")  # fake ghq: no clones unless a test lists some
         self.calls: list[list[str]] = []
 
     def __call__(self, cmd, cwd=None, env=None) -> Result:
         cmd = list(cmd)
         self.calls.append(cmd)
+        if cmd[0] == "ghq":
+            assert cmd == ["ghq", "list", "-p"], cmd
+            return self.ghq
         if cmd[0] == "gh":
             for prefix, reply in self.gh.items():
                 if tuple(cmd[1 : 1 + len(prefix)]) == prefix:

@@ -61,6 +61,20 @@ def find_clones(roots: list[Path], max_depth: int = 3) -> list[Path]:
     return sorted(found)
 
 
+def ghq_clones(runner: Runner) -> tuple[list[Path] | None, str | None]:
+    """Clones ghq manages (ghq list -p), as (paths, error); (None, None) without ghq.
+
+    Only lists: syncghrepo never changes ghq.root, runs ghq get or moves a clone.
+    """
+    result = runner(["ghq", "list", "-p"])
+    if result.code == 127:  # not installed
+        return None, None
+    if not result.ok:
+        return None, f"ghq list -p failed: {result.last_line()}"
+    listed = [Path(line.strip()) for line in result.out.splitlines() if line.strip()]
+    return find_clones(listed, 0), None
+
+
 def short_path(path: str | Path) -> str:
     home = str(Path.home())
     text = str(path)

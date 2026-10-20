@@ -50,9 +50,11 @@ def test_run_refuses_anything_not_allowlisted(cmd, tmp_path):
 
 
 def test_allowlist_is_only_git_gh_and_lockfile_tools():
-    assert {prefix[0] for prefix in run.ALLOWED} == {"git", "git-sync", "gh", "uv", "cargo",
-                                                      "npm", "pnpm", "bundle"}  # fmt: skip
+    assert {prefix[0] for prefix in run.ALLOWED} == {"git", "git-sync", "gh", "ghq", "uv",
+                                                      "cargo", "npm", "pnpm", "bundle"}  # fmt: skip
     assert {prefix[1] for prefix in run.ALLOWED if prefix[0] == "gh"} == {"api", "search", "repo"}
+    assert [p for p in run.ALLOWED if p[0] == "ghq"] == [("ghq", "list")]  # never ghq get
+    assert not run.allowed(["ghq", "get", "x/y"])
 
 
 def test_every_lockfile_command_is_allowed():

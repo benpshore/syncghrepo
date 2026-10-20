@@ -2,8 +2,12 @@
 
 Keep all work in your local clones saved and in sync, and list what is still
 open, for you or for an agent to triage. One plain CLI with exit codes and
-`--json`, so a Makefile can call it. Standard library plus the `git`, `gh` and
-`git-sync` CLIs; no other dependencies, and no code shared with makeghrepo or reconcile-tasks.
+`--json`, so a Makefile can call it. Standard library plus existing tools it
+drives instead of reimplementing them: `git`, `gh`,
+[git-sync](https://github.com/simonthum/git-sync) (saving and syncing),
+[ghq](https://github.com/x-motemen/ghq) (finding clones) and
+[gh-dash](https://github.com/dlvhdr/gh-dash) (reviewing PRs and issues). No other
+dependencies, and no code shared with makeghrepo or reconcile-tasks.
 
 Pipeline: `makeghrepo` (create repos) → **`syncghrepo`** (save, sync, list open
 work) → `reconcile-tasks` (turn that work into tasks). The only contract between
@@ -11,7 +15,7 @@ syncghrepo and reconcile-tasks is the versioned `--json` report below.
 
 **No AI.** syncghrepo makes no AI/LLM calls and has no network code of its own:
 only `git`, `git-sync` (a bash script that runs git), `gh` (`api`, `search prs`,
-`repo sync`), the lockfile tools listed below, and the Python standard library. `run.ALLOWED` enforces this: any other command
+`repo sync`), `ghq list`, the lockfile tools listed below, and the Python standard library. `run.ALLOWED` enforces this: any other command
 (`gh models`, `gh copilot`, `curl`, an AI CLI, ...) is refused, and tests check
 that the code imports only the standard library and has no dependencies.
 
@@ -68,6 +72,21 @@ it and reports what happened:
    deleted-upstream branches, stashes and linked worktrees. Repos come from `gh`:
    yours, your organisations', collaborations, and repos you opened PRs in.
 
+**Finding clones.** Clones come from the roots (`~/code` or `$SYNCGHREPO_ROOTS`)
+and, unless `--root` is given, from [ghq](https://github.com/x-motemen/ghq)
+(`ghq list -p`), deduplicated. syncghrepo only lists: it never changes `ghq.root`,
+runs `ghq get` or moves a clone. Without ghq, the roots alone are used.
+
+**Review UI.** With `--apply`, syncghrepo writes a
+[gh-dash](https://github.com/dlvhdr/gh-dash) config with sections for your open
+PRs, your drafts, review requests and issues assigned to you, all scoped to the
+discovered repos (`repo:owner/name ...`), plus `repoPaths` so gh dash can check a PR
+out in your clone. It goes to `~/.config/gh-dash/config.yml` (or
+`$XDG_CONFIG_HOME/gh-dash/`) only if no file is there; otherwise next to it as
+`config.syncghrepo.yml`, so your own config is never touched (then:
+`gh dash --config ~/.config/gh-dash/config.syncghrepo.yml`). syncghrepo never
+launches `gh dash`.
+
 Clones in the middle of a merge or rebase, with a detached HEAD, or with no
 commits yet, are left alone and reported. Linked worktrees are listed but not
 synced. Nothing is ever reset, cleaned, force-pushed or discarded.
@@ -96,8 +115,8 @@ sync:      ; syncghrepo --apply
 sync-plan: ; syncghrepo --fetch --json > sync-plan.json
 ```
 
-A dry run writes nothing: no commits, refs, index or working-tree changes, and
-no fetch unless `--fetch` (which only updates remote-tracking refs). Conflicts are
+A dry run writes nothing: no commits, refs, index or working-tree changes, no
+gh-dash config, and no fetch unless `--fetch` (which only updates remote-tracking refs). Conflicts are
 predicted with `git merge-tree` in a scratch object store outside the clone; a
 rebase replays commit by commit, so the prediction is close but not a guarantee.
 
@@ -138,6 +157,8 @@ unresolved work whose `id` stays the same across runs while the work is the same
 | `user` | string or null | GitHub login, null if GitHub was not used |
 | `dry_run` | bool | true unless `--apply` |
 | `roots` | [string] | folders searched for clones |
+| `ghq_clones` | int or null | clones found with `ghq list -p`; null when ghq was not used (`--root` given) or is not installed |
+| `gh_dash` | object or null | the gh-dash config: `path`, `written` (false in a dry run), `existing_config` (a `config.yml` was already there, so `path` is `config.syncghrepo.yml`); null without GitHub |
 | `summary` | object | counts, below |
 | `items` | [item] | unresolved work, below |
 | `repos` | [repo] | full detail per repo, below |

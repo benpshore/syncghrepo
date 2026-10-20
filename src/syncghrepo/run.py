@@ -1,7 +1,7 @@
 """Run commands with a timeout. Every git, gh and lockfile command goes through a Runner.
 
 syncghrepo makes no AI/LLM calls and no network calls of its own: it is plain git,
-gh, git-sync and the standard library. run() enforces that with an allowlist, so nothing
+gh, git-sync, ghq and the standard library. run() enforces that with an allowlist, so nothing
 else (e.g. `gh models`, `gh copilot`, curl, an AI CLI) can ever be started.
 """
 
@@ -27,6 +27,7 @@ ALLOWED = (
     ("gh", "api"),  # user, user/repos and the fixed GraphQL query in github.py
     ("gh", "search", "prs"),
     ("gh", "repo", "sync"),
+    ("ghq", "list"),  # clone discovery only; never ghq get, never ghq.root changes
     # Lockfile regeneration for conflicts (resolve.LOCKFILES).
     ("uv", "lock"),
     ("cargo", "update", "--workspace"),
