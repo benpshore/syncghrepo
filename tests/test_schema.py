@@ -19,22 +19,31 @@ from syncghrepo.run import Result
 
 SCHEMA_VERSION = 1
 TOP = {"schema_version", "tool", "version", "generated_at", "user", "dry_run", "roots",
-       "ghq_clones", "gh_dash", "summary", "items", "repos", "errors"}  # fmt: skip
+       "ghq_clones", "gh_dash", "summary", "items", "repos", "errors",
+       "mode", "cloned", "nested"}  # fmt: skip
+MODES = {"local", "api"}
+CLONE_RECORD = {"name", "path", "archived", "fork", "status", "note"}
+CLONE_RECORD_STATUS = {"would-clone", "cloned", "skipped", "failed"}
+NESTED = {"path", "parent", "repo", "submodule", "status"}
+REMOTE_BRANCH = {"name", "age_days", "committed_at", "url"}
+FORK_SYNC = {"cmd", "ok", "note"}
 GH_DASH = {"path", "written", "existing_config"}
 SUMMARY = {
     "repos", "on_github", "cloned", "not_cloned", "clones", "clone_status", "saved_files",
     "held_back_files", "auto_resolved", "conflicts", "open_prs", "draft_prs",
     "prs_needing_review", "ci_failing", "assigned_issues", "stashes", "unpushed_branches",
     "stale_branches", "needs_attention", "items",
+    "remote_stale_branches", "forks_synced", "new_clones", "clones_skipped", "nested",
 }  # fmt: skip
 ITEM = {"id", "kind", "repo", "title", "url", "path", "branch", "flags", "updated_at", "detail"}
 KINDS = {"pr", "issue", "ci_failing", "github_error", "conflict", "error", "skipped",
          "held_back", "not_pushed", "unpushed_branch", "gone_branch", "stale_branch", "stash",
-         "worktree"}  # fmt: skip
+         "worktree", "remote_stale_branch", "fork_sync_failed", "clone_skipped"}  # fmt: skip
 REPO = {"name", "url", "github", "fork", "archived", "default_branch", "sources", "clones",
-        "remote", "remote_error", "attention"}  # fmt: skip
+        "remote", "remote_error", "attention", "fork_sync"}  # fmt: skip
 REMOTE = {"name", "url", "fork", "archived", "parent", "can_push", "default_branch", "ci",
-          "ci_commit", "open_prs", "prs", "assigned_issues", "assigned_issues_total"}  # fmt: skip
+          "ci_commit", "open_prs", "prs", "assigned_issues", "assigned_issues_total",
+          "stale_branches"}  # fmt: skip
 PR = {"number", "title", "url", "author", "mine", "draft", "review_decision",
       "review_requested", "needs_review", "updated_at"}  # fmt: skip
 ISSUE = {"number", "title", "url", "updated_at"}
@@ -42,7 +51,7 @@ CLONE = {
     "path", "origin", "branch", "upstream", "upstream_gone", "default_branch", "head",
     "changes", "untracked", "busy", "ahead", "behind", "unpushed", "branches", "stashes",
     "worktrees", "saved", "held_back", "save_skipped", "resolved", "conflicts", "backup_refs",
-    "actions", "status", "note", "fork", "can_push", "git_sync",
+    "actions", "status", "note", "fork", "can_push", "git_sync", "nested_in", "submodule",
 }  # fmt: skip
 BRANCH = {"name", "upstream", "unpushed", "age_days", "gone", "stale"}
 STASH = {"commit", "ref", "message", "created"}
@@ -99,6 +108,8 @@ def test_json_schema_is_stable(tmp_path, origin, clone, capsys):
 
     assert report["schema_version"] == cli.SCHEMA_VERSION == SCHEMA_VERSION
     assert set(report) == TOP
+    assert report["mode"] in MODES and report["mode"] == "local"
+    assert report["cloned"] == [] and report["nested"] == []  # $SYNCGHREPO_ROOTS: no cloning
     assert set(report["summary"]) == SUMMARY
     assert set(report["gh_dash"]) == GH_DASH
     (repo,) = report["repos"]
@@ -145,5 +156,6 @@ def test_readme_documents_every_field_and_kind():
     assert f"schema_version` is `{SCHEMA_VERSION}`" in section
     documented = set(re.findall(r"`([a-z_]+)`", section))
     fields = (TOP | SUMMARY | ITEM | KINDS | REPO | REMOTE | PR | ISSUE | CLONE | BRANCH
-              | STASH | ACTION | GIT_SYNC_RUN | SAVED | HELD | CONFLICT | GH_DASH)  # fmt: skip
+              | STASH | ACTION | GIT_SYNC_RUN | SAVED | HELD | CONFLICT | GH_DASH | MODES
+              | CLONE_RECORD | NESTED | REMOTE_BRANCH | FORK_SYNC)  # fmt: skip
     assert sorted(fields - documented) == []

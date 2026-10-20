@@ -62,6 +62,9 @@ def hold_reason(root: Path, rel: str) -> str | None:
         info = path.lstat()
     except OSError:
         return None  # deleted: committing the deletion is safe
+    if stat.S_ISDIR(info.st_mode) and (path / ".git").exists():
+        # git add -A would embed it as a gitlink; it is synced on its own instead.
+        return "a nested git repo (synced on its own); .gitignore it or make it a submodule"
     if not stat.S_ISREG(info.st_mode):
         return None
     if info.st_size > MAX_FILE_BYTES:

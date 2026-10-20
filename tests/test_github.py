@@ -1,4 +1,5 @@
 import json
+from datetime import UTC, datetime
 
 import pytest
 from conftest import FakeRunner
@@ -22,7 +23,14 @@ def repo_line(name, *, fork=False, archived=False, owner_type="User"):
 
 
 def status_payload(
-    name="benpshore/proj", *, ci="SUCCESS", prs=(), issues=(), fork=False, permission="ADMIN"
+    name="benpshore/proj",
+    *,
+    ci="SUCCESS",
+    prs=(),
+    issues=(),
+    fork=False,
+    permission="ADMIN",
+    archived=False,
 ):
     return json.dumps(
         {
@@ -31,7 +39,7 @@ def status_payload(
                     "nameWithOwner": name,
                     "url": f"https://github.com/{name}",
                     "isFork": fork,
-                    "isArchived": False,
+                    "isArchived": archived,
                     "viewerPermission": permission,
                     "parent": {"nameWithOwner": "up/proj"} if fork else None,
                     "defaultBranchRef": {
@@ -136,6 +144,45 @@ def test_repo_status_for_contributed_repo_keeps_only_my_prs():
     runner = FakeRunner({("api", "graphql"): Result(0, status_payload("up/lib", prs=prs))})
     status = github.repo_status(runner, "up/lib", "benpshore", all_prs=False)
     assert [p["number"] for p in status["prs"]] == [1, 3]
+
+
+def ref(name, date, *, open_prs=0):
+    """One branch as the --api branches query prints it (gh api --jq, one JSON line)."""
+    return {"name": name, "committed_at": date, "open_prs": open_prs}
+
+
+def branch_lines(refs):
+    return Result(0, "".join(json.dumps(r) + "\n" for r in refs))
+
+
+def test_remote_stale_branches_only_when_asked():
+    now = datetime(2026, 10, 20, tzinfo=UTC).timestamp()
+    refs = [
+        ref("main", "2020-01-01T00:00:00Z"),  # the default branch: never stale
+        ref("old", "2026-08-01T00:00:00Z"),
+        ref("old-with-pr", "2026-08-01T00:00:00Z", open_prs=1),
+        ref("fresh", "2026-10-15T00:00:00Z"),
+    ]
+
+    def graphql(cmd):
+        return branch_lines(refs) if "--paginate" in cmd else Result(0, status_payload())
+
+    runner = FakeRunner({("api", "graphql"): graphql})
+    status = github.repo_status(runner, "benpshore/proj", "benpshore", branches=True, now=now)
+    assert status["stale_branches"] == [
+        {
+            "name": "old",
+            "age_days": 80,
+            "committed_at": "2026-08-01T00:00:00Z",
+            "url": "https://github.com/benpshore/proj/tree/old",
+        }
+    ]
+    paged = runner.calls[1]  # every page of branches, not just the first 100
+    assert paged[:4] == ["gh", "api", "graphql", "--paginate"] and "$endCursor" in paged[5]
+    assert "owner=benpshore" in paged and "name=proj" in paged
+    plain = FakeRunner({("api", "graphql"): graphql})
+    assert github.repo_status(plain, "benpshore/proj", "benpshore")["stale_branches"] is None
+    assert len(plain.calls) == 1  # the normal run does not ask for branches
 
 
 def test_repo_status_raises_on_gh_failure():
