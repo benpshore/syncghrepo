@@ -10,6 +10,8 @@ import pytest
 
 from syncghrepo.run import Result, run
 
+GIT_SYNC = Path(__file__).parent / "fixtures" / "git-sync"
+
 
 @pytest.fixture(autouse=True)
 def isolated_git(tmp_path_factory, monkeypatch):
@@ -18,13 +20,14 @@ def isolated_git(tmp_path_factory, monkeypatch):
     cfg.write_text("[init]\n\tdefaultBranch = main\n[advice]\n\tmergeConflict = false\n")
     monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(cfg))
     monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
+    monkeypatch.setenv("SYNCGHREPO_GIT_SYNC", str(GIT_SYNC))
     for role in ("AUTHOR", "COMMITTER"):
         monkeypatch.setenv(f"GIT_{role}_NAME", "Test User")
         monkeypatch.setenv(f"GIT_{role}_EMAIL", "test@example.com")
 
 
 class FakeRunner:
-    """Runs git for real against local repos; answers everything else from fakes.
+    """Runs git and git-sync for real against local repos; fakes everything else.
 
     gh maps a gh argument prefix (tuple) to a Result or a callable(cmd) -> Result.
     tools maps a full command prefix, e.g. ("uv", "lock"), to callable(cmd, cwd).
@@ -49,6 +52,8 @@ class FakeRunner:
         if cmd[0] == "git":
             hooked = self.git_hook(cmd) if self.git_hook else None
             return hooked or run(cmd, cwd, timeout=30, env=env)
+        if Path(cmd[0]).name == "git-sync":
+            return run(cmd, cwd, timeout=60, env=env)
         for prefix, reply in self.tools.items():
             if tuple(cmd[: len(prefix)]) == prefix:
                 return reply(cmd, cwd)
@@ -57,6 +62,9 @@ class FakeRunner:
     def git_subcommands(self) -> list[str]:
         """git subcommands run, skipping global options such as -c and --no-optional-locks."""
         return [subcommand(c) for c in self.calls if c[0] == "git"]
+
+    def git_sync_calls(self) -> list[list[str]]:
+        return [c[1:] for c in self.calls if Path(c[0]).name == "git-sync"]
 
     def git_commands(self) -> list[str]:
         return [" ".join(c[c.index(subcommand(c)) :]) for c in self.calls if c[0] == "git"]

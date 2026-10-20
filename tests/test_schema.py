@@ -41,11 +41,12 @@ CLONE = {
     "path", "origin", "branch", "upstream", "upstream_gone", "default_branch", "head",
     "changes", "untracked", "busy", "ahead", "behind", "unpushed", "branches", "stashes",
     "worktrees", "saved", "held_back", "save_skipped", "resolved", "conflicts", "backup_refs",
-    "actions", "status", "note", "fork", "can_push",
+    "actions", "status", "note", "fork", "can_push", "git_sync",
 }  # fmt: skip
 BRANCH = {"name", "upstream", "unpushed", "age_days", "gone", "stale"}
 STASH = {"commit", "ref", "message", "created"}
 ACTION = {"cmd", "ok", "note"}
+GIT_SYNC_RUN = {"code", "log"}
 SAVED = {"branch", "files", "commit"}
 HELD = {"path", "reason"}
 CONFLICT = {"path", "how"}  # plus "error" when a step failed
@@ -112,6 +113,7 @@ def test_json_schema_is_stable(tmp_path, origin, clone, capsys):
     assert clone_out["branches"] and all(set(b) == BRANCH for b in clone_out["branches"])
     assert clone_out["stashes"] and all(set(s) == STASH for s in clone_out["stashes"])
     assert all(set(a) == ACTION for a in clone_out["actions"])
+    assert set(clone_out["git_sync"]) == GIT_SYNC_RUN and held_out["git_sync"] is None
     assert set(clone_out["saved"]) == SAVED
     assert held_out["held_back"] and all(set(h) == HELD for h in held_out["held_back"])
     assert clone_out["conflicts"] and all(set(c) >= CONFLICT for c in clone_out["conflicts"])
@@ -141,5 +143,5 @@ def test_readme_documents_every_field_and_kind():
     assert f"schema_version` is `{SCHEMA_VERSION}`" in section
     documented = set(re.findall(r"`([a-z_]+)`", section))
     fields = (TOP | SUMMARY | ITEM | KINDS | REPO | REMOTE | PR | ISSUE | CLONE | BRANCH
-              | STASH | ACTION | SAVED | HELD | CONFLICT)  # fmt: skip
+              | STASH | ACTION | GIT_SYNC_RUN | SAVED | HELD | CONFLICT)  # fmt: skip
     assert sorted(fields - documented) == []

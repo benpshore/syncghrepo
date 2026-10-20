@@ -1,18 +1,17 @@
-"""Auto-save: commit uncommitted work as a WIP commit, never on the default branch.
+"""What auto-save may touch: the secret check, and wip/ branch names.
 
-Never commits ignored files (git add skips them). If any changed file is secret-looking
-(by name or content) or very large, the whole clone is skipped and the files reported:
-nothing is committed, synced or pushed there until a person looks.
+git-sync makes the commits (git add -A, so ignored files are never added). Before
+that, if any changed file is secret-looking (by name or content) or very large, the
+whole clone is skipped and the files reported: nothing is committed, synced or
+pushed there until a person looks.
 """
 
 import re
 import socket
 import stat
-import tempfile
 from pathlib import Path
 
-from .local import is_protected
-from .run import Git, Result
+from .run import Git
 
 MAX_FILE_BYTES = 50 * 1024 * 1024
 MAX_FILES = 2000  # more than this usually means a missing .gitignore, not work
@@ -99,53 +98,3 @@ def held_back(git: Git, root: Path) -> list[dict]:
     """Changed files that must never be committed: secret-looking or too large."""
     paths = changed_paths(git) or []
     return [{"path": p, "reason": r} for p in paths if (r := hold_reason(root, p))]
-
-
-def plan(git: Git, root: Path, info: dict, day: str) -> dict | None:
-    """What auto-save would commit and where, or None if there is nothing to save.
-
-    Callers check held_back() first; a clone with held-back files is skipped.
-    """
-    paths = changed_paths(git)
-    if paths is None:
-        return {"files": [], "held_back": [], "branch": None, "new_branch": False,
-                "skipped": "git status failed"}  # fmt: skip
-    if not paths:
-        return None
-    held = [{"path": p, "reason": r} for p in paths if (r := hold_reason(root, p))]
-    held_paths = {h["path"] for h in held}
-    files = [p for p in paths if p not in held_paths]
-    branch = info["branch"]
-    new_branch = is_protected(branch, info["default_branch"])
-    skipped = None
-    if len(files) > MAX_FILES:
-        skipped = f"{len(files)} files changed (over {MAX_FILES}; missing .gitignore?)"
-    elif files and new_branch:
-        branch = wip_branch(git, day)
-    return {
-        "files": files,
-        "held_back": held,
-        "branch": branch,
-        "new_branch": bool(files) and new_branch and not skipped,
-        "skipped": skipped,
-    }
-
-
-def commit(git: Git, saving: dict, stamp: str) -> Result:
-    """Create the WIP commit (on a new wip/ branch if needed). Only saving['files'] go in."""
-    if saving["new_branch"]:
-        switched = git("switch", "--quiet", "-c", saving["branch"])
-        if not switched.ok:
-            return switched
-    files = saving["files"]
-    listing = "\n".join(f"  {p}" for p in files[:50]) + ("\n  ..." if len(files) > 50 else "")
-    message = f"wip: auto-save {len(files)} file(s)\n\nSaved by syncghrepo at {stamp}:\n{listing}\n"
-    with tempfile.TemporaryDirectory() as tmp:
-        spec = Path(tmp, "paths")
-        spec.write_bytes(b"\0".join(p.encode("utf-8", "surrogateescape") for p in files))
-        from_file = (f"--pathspec-from-file={spec}", "--pathspec-file-nul")
-        added = git("add", "--all", *from_file)
-        if not added.ok:
-            return added
-        # A pathspec commits only these paths, so anything else already staged stays out.
-        return git("commit", "--quiet", "--no-verify", "-m", message, *from_file)

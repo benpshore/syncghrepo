@@ -61,7 +61,9 @@ def test_default_is_a_dry_run_with_json(tmp_path, origin, clone, capsys):
     assert set(repos) == {"benpshore/proj", "benpshore/other", "plain"}
     proj = repos["benpshore/proj"]["clones"][0]
     assert proj["status"] == "would-update"
-    assert [a["cmd"] for a in proj["actions"]][-1] == f"git push -u origin HEAD:refs/heads/{WIP}"
+    planned = [a["cmd"] for a in proj["actions"]]
+    assert planned[-1] == "git-sync"
+    assert f"git push -u origin HEAD:refs/heads/{WIP}" in planned
     assert git(clone, "branch", "--show-current") == "main"
     assert git(clone, "diff", "--name-only") == "a.txt"  # still uncommitted
     assert git(clone, "diff", "--cached", "--name-only") == ""
@@ -94,7 +96,7 @@ def test_apply_saves_syncs_pushes_and_summarizes(tmp_path, origin, clone, capsys
     assert remote_head(origin, WIP) == git(clone, "rev-parse", "HEAD")
     assert "Clones: 1 updated" in out
     assert "Saved: 1 file(s), 0 held back" in out
-    assert "Done:" in out and "ok git commit 1 file(s)" in out
+    assert "Done:" in out and "ok git-sync  # In sync, all fine." in out
     assert "CI failure on main (abcdef1)" in out
     assert "Not cloned, nothing open (1): benpshore/other" in out
 
@@ -106,7 +108,7 @@ def test_read_only_permission_means_no_push(tmp_path, origin, clone, capsys):
     runner = FakeRunner(gh_replies(proj="READ"))
     cli.main(["--root", str(tmp_path / "code"), "--apply"], runner=runner)
     assert "push" not in runner.git_subcommands()
-    assert "not pushed: 1 commit(s) not pushed: no known push access" in capsys.readouterr().out
+    assert "not synced: no known push access; local work left as is" in capsys.readouterr().out
 
 
 def test_conflict_exits_1(tmp_path, origin, clone, capsys):

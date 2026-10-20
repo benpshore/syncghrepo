@@ -50,14 +50,19 @@ def test_run_refuses_anything_not_allowlisted(cmd, tmp_path):
 
 
 def test_allowlist_is_only_git_gh_and_lockfile_tools():
-    assert {prefix[0] for prefix in run.ALLOWED} == {"git", "gh", "uv", "cargo", "npm", "pnpm",
-                                                      "bundle"}  # fmt: skip
+    assert {prefix[0] for prefix in run.ALLOWED} == {"git", "git-sync", "gh", "uv", "cargo",
+                                                      "npm", "pnpm", "bundle"}  # fmt: skip
     assert {prefix[1] for prefix in run.ALLOWED if prefix[0] == "gh"} == {"api", "search", "repo"}
 
 
 def test_every_lockfile_command_is_allowed():
     for cmd in resolve.LOCKFILES.values():
         assert run.allowed(cmd), cmd
+
+
+def test_git_sync_is_allowed_by_base_name():
+    assert run.allowed(["/Users/x/.local/bin/git-sync", "-s", "-n", "check"])
+    assert not run.allowed(["/opt/bin/git-syncer"])
 
 
 def test_allowed_commands_still_run(tmp_path):
