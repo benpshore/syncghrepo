@@ -128,7 +128,11 @@ def inspect(runner: Runner, path: Path, *, stale_days: int = 30, now: float | No
         if info["unpushed"] or info["gone"] or info["stale"]:
             branches.append(info)
 
-    stash_lines = git.out("stash", "list", "--format=%gd: %gs (%cr)") or ""
+    stash_lines = git.out("stash", "list", "--format=%H%x09%gd%x09%gs%x09%cI") or ""
+    stashes = []
+    for line in stash_lines.splitlines():
+        commit, ref, message, created = [*line.split("\t", 3), "", "", ""][:4]
+        stashes.append({"commit": commit, "ref": ref, "message": message, "created": created})
     worktree_lines = (git.out("worktree", "list", "--porcelain") or "").splitlines()
     worktrees = [line[9:] for line in worktree_lines if line.startswith("worktree ")][1:]
 
@@ -147,6 +151,6 @@ def inspect(runner: Runner, path: Path, *, stale_days: int = 30, now: float | No
         "behind": behind,
         "unpushed": int(unpushed) if unpushed and unpushed.isdigit() else 0,
         "branches": branches,
-        "stashes": [line for line in stash_lines.splitlines() if line],
+        "stashes": stashes,
         "worktrees": worktrees,
     }
