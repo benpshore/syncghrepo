@@ -1,6 +1,8 @@
 """GitHub side: which repos you have, and the open work in each. Read-only."""
 
 import json
+import time
+from datetime import datetime
 
 from .run import Runner
 
@@ -29,6 +31,27 @@ query($owner: String!, $name: String!, $me: String!) {
   }
 }
 """
+
+
+# Every branch on GitHub (--api mode only), all pages: one JSON line per branch.
+BRANCHES_QUERY = """
+query($owner: String!, $name: String!, $endCursor: String) {
+  repository(owner: $owner, name: $name) {
+    refs(refPrefix: "refs/heads/", first: 100, after: $endCursor) {
+      pageInfo { hasNextPage endCursor }
+      nodes {
+        name
+        target { ... on Commit { committedDate } }
+        associatedPullRequests(states: OPEN) { totalCount }
+      }
+    }
+  }
+}
+"""
+BRANCHES_JQ = (
+    ".data.repository.refs.nodes[] | {name, committed_at: .target.committedDate,"
+    " open_prs: .associatedPullRequests.totalCount}"
+)
 
 
 PUSH_PERMISSIONS = frozenset({"WRITE", "MAINTAIN", "ADMIN"})
@@ -106,11 +129,50 @@ def discover(runner: Runner, me: str) -> tuple[dict[str, dict], list[str]]:
     return repos, errors
 
 
-def repo_status(runner: Runner, name: str, me: str, *, all_prs: bool = True) -> dict:
+def stale_branches(
+    runner: Runner, name: str, default: str | None, stale_days: int, now: float
+) -> list[dict]:
+    """Branches on GitHub with no commits for stale_days, other than the default
+    branch and branches with an open PR."""
+    owner, repo = name.split("/", 1)
+    raw = gh(runner, "api", "graphql", "--paginate", "-f", f"query={BRANCHES_QUERY}",
+             "-f", f"owner={owner}", "-f", f"name={repo}", "--jq", BRANCHES_JQ)  # fmt: skip
+    found = []
+    for line in raw.splitlines():
+        if not line.strip():
+            continue
+        node = json.loads(line)
+        date = node.get("committed_at") or ""
+        if node["name"] == default or not date or node.get("open_prs"):
+            continue
+        age = int((now - datetime.fromisoformat(date).timestamp()) // 86400)
+        if age >= stale_days:
+            found.append(
+                {
+                    "name": node["name"],
+                    "age_days": age,
+                    "committed_at": date,
+                    "url": f"https://github.com/{name}/tree/{node['name']}",
+                }
+            )
+    return sorted(found, key=lambda branch: branch["name"])
+
+
+def repo_status(
+    runner: Runner,
+    name: str,
+    me: str,
+    *,
+    all_prs: bool = True,
+    branches: bool = False,
+    stale_days: int = 30,
+    now: float | None = None,
+) -> dict:
     """Open PRs, CI on the default branch, and issues assigned to me.
 
     With all_prs False (repos I only contributed to), keep just my PRs and PRs
-    that request my review.
+    that request my review. With branches (--api mode), also the remote branches
+    that are stale (stale_branches; null otherwise).
     """
     owner, repo = name.split("/", 1)
     raw = gh(
@@ -177,4 +239,13 @@ def repo_status(runner: Runner, name: str, me: str, *, all_prs: bool = True) -> 
             for node in data["issues"]["nodes"]
         ],
         "assigned_issues_total": data["issues"]["totalCount"],
+        "stale_branches": stale_branches(
+            runner,
+            data["nameWithOwner"],
+            ref.get("name"),
+            stale_days,
+            time.time() if now is None else now,
+        )
+        if branches
+        else None,
     }

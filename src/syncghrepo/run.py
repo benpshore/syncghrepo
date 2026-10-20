@@ -22,11 +22,13 @@ QUIET = {
 
 # The only commands syncghrepo may run (matched as argument prefixes).
 ALLOWED = (
-    ("git",),
+    ("git",),  # includes git submodule (status, update --init --recursive)
+    ("git", "submodule"),  # listed on its own so the allowlist documents it
     ("git-sync",),  # simonthum/git-sync: auto-commit, rebase, push (plain bash + git)
     ("gh", "api"),  # user, user/repos and the fixed GraphQL query in github.py
     ("gh", "search", "prs"),
     ("gh", "repo", "sync"),
+    ("gh", "repo", "clone"),  # only repos of yours with no clone anywhere under the roots
     ("ghq", "list"),  # clone discovery only; never ghq get, never ghq.root changes
     # Lockfile regeneration for conflicts (resolve.LOCKFILES).
     ("uv", "lock"),
@@ -105,9 +107,22 @@ def decode(data: bytes) -> str:
     return data.decode("utf-8", "surrogateescape")
 
 
+# Commands that may download a whole repo get more time than the default.
+LONG_TIMEOUT = 1800.0
+
+
+def long_running(cmd: Sequence[str]) -> bool:
+    """gh repo clone and git submodule update download repos."""
+    words = list(cmd)
+    if words[:3] == ["gh", "repo", "clone"]:
+        return True
+    return bool(words) and words[0] == "git" and "submodule" in words and "update" in words
+
+
 def make_runner(timeout: float) -> Runner:
     def runner(cmd: Sequence[str], cwd: str | None = None, env=None) -> Result:
-        return run(cmd, cwd, timeout, env)
+        limit = max(timeout, LONG_TIMEOUT) if long_running(cmd) else timeout
+        return run(cmd, cwd, limit, env)
 
     return runner
 

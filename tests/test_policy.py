@@ -55,6 +55,18 @@ def test_allowlist_is_only_git_gh_and_lockfile_tools():
     assert {prefix[1] for prefix in run.ALLOWED if prefix[0] == "gh"} == {"api", "search", "repo"}
     assert [p for p in run.ALLOWED if p[0] == "ghq"] == [("ghq", "list")]  # never ghq get
     assert not run.allowed(["ghq", "get", "x/y"])
+    assert run.allowed(["gh", "repo", "clone", "benpshore/x", "/code/x"])
+    assert run.allowed(["git", "submodule", "update", "--init", "--recursive"])
+    for cmd in (["gh", "repo", "delete", "x/y"], ["gh", "repo", "edit", "x/y"],
+                ["gh", "repo", "create", "x"], ["gh", "pr", "merge", "1"]):  # fmt: skip
+        assert not run.allowed(cmd), cmd
+
+
+def test_only_clone_and_submodule_update_get_the_long_timeout():
+    assert run.long_running(["gh", "repo", "clone", "a/b", "/code/b"])
+    assert run.long_running(["git", "--no-optional-locks", "submodule", "update", "--init"])
+    assert not run.long_running(["git", "submodule", "status"])
+    assert not run.long_running(["gh", "repo", "sync", "a/b"])
 
 
 def test_every_lockfile_command_is_allowed():

@@ -21,6 +21,7 @@ BRANCH_FORMAT = (
     "%(refname:short)%09%(upstream:short)%09%(upstream:track,nobracket)%09%(committerdate:unix)"
 )
 PROTECTED = frozenset({"main", "master"})
+SUBMODULE_LINE = re.compile(r"^([ +U-])[0-9a-f]+ (.+?)(?: \(.*\))?$")
 
 
 def github_name(url: str | None) -> str | None:
@@ -59,6 +60,98 @@ def find_clones(roots: list[Path], max_depth: int = 3) -> list[Path]:
                 continue
             stack.extend((child, depth + 1) for child in children)
     return sorted(found)
+
+
+NESTED_DEPTH = 4  # how deep to search inside a clone for nested repos
+
+
+def visible_dirs(folder: Path) -> list[Path]:
+    """Subfolders worth searching: not hidden, not a symlink, not a build folder."""
+    try:
+        return [
+            child
+            for child in folder.iterdir()
+            if child.is_dir()
+            and not child.is_symlink()
+            and not child.name.startswith(".")
+            and child.name not in SKIP_DIRS
+        ]
+    except OSError:
+        return []
+
+
+def submodule_status(runner: Runner, path: Path) -> list[tuple[str, str]] | None:
+    """(state, path relative to the clone) per submodule, recursively; None if it fails.
+
+    state is git's: "-" not initialized, "+" checked out at another commit than the
+    one recorded, "U" merge conflicts, " " at the recorded commit.
+    """
+    if not (path / ".gitmodules").is_file():
+        return []
+    result = Git(runner, path)("submodule", "status", "--recursive")
+    if not result.ok:
+        return None
+    entries = []
+    for line in result.out.splitlines():  # "<state><sha> <path>[ (<describe>)]"
+        match = SUBMODULE_LINE.match(line)
+        if match:
+            entries.append((match[1], match[2]))
+    return entries
+
+
+def nested_repos(runner: Runner, parents: list[Path], max_depth: int = NESTED_DEPTH) -> list[dict]:
+    """Git repos inside the given clones: nested clones (their own .git folder) and
+    initialized submodules, as {path, parent, submodule}, sorted by path.
+
+    Nested clones are searched for at most max_depth folders down (hidden and build
+    folders are skipped); submodules come from git, wherever they are. Linked
+    worktrees (a .git file that is not a submodule's) are skipped, and so is any
+    repo that is itself one of parents: nothing is processed twice.
+    """
+    known = {parent.resolve() for parent in parents}
+    found: dict[Path, bool] = {}
+    for parent in sorted(known):
+        candidates: list[Path] = []
+        stack = [(parent, 0)]
+        while stack:
+            folder, depth = stack.pop()
+            for child in visible_dirs(folder):
+                if (child / ".git").exists():
+                    candidates.append(child)
+                if depth + 1 < max_depth:
+                    stack.append((child, depth + 1))
+        for state, rel in submodule_status(runner, parent) or []:
+            if state != "-":
+                candidates.append(parent / rel)
+        for candidate in candidates:
+            path = candidate.resolve()
+            if path in known or path in found:
+                continue
+            git = Git(runner, path)
+            top = git.out("rev-parse", "--show-toplevel")
+            if not top or Path(top).resolve() != path:
+                continue
+            submodule = bool(git.out("rev-parse", "--show-superproject-working-tree"))
+            if (path / ".git").is_file() and not submodule:
+                continue  # a linked worktree: reported through its main clone
+            found[path] = submodule
+    everything = known | set(found)
+    nested = []
+    for path, submodule in sorted(found.items()):
+        parent = max(
+            (other for other in everything if other != path and path.is_relative_to(other)),
+            key=lambda other: len(other.parts),
+            default=None,
+        )
+        nested.append({"path": path, "parent": parent, "submodule": submodule})
+    return nested
+
+
+def nesting_level(path: Path, nested: list[dict]) -> int:
+    """How many nested repos enclose path (0 for one directly inside a top-level clone)."""
+    return sum(
+        1 for other in nested if other["path"] != path and path.is_relative_to(other["path"])
+    )
 
 
 def ghq_clones(runner: Runner) -> tuple[list[Path] | None, str | None]:

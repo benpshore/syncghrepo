@@ -14,22 +14,29 @@ work) → `reconcile-tasks` (turn that work into tasks). The only contract betwe
 syncghrepo and reconcile-tasks is the versioned `--json` report below.
 
 **No AI.** syncghrepo makes no AI/LLM calls and has no network code of its own:
-only `git`, `git-sync` (a bash script that runs git), `gh` (`api`, `search prs`,
-`repo sync`), `ghq list`, the lockfile tools listed below, and the Python standard library. `run.ALLOWED` enforces this: any other command
+only `git` (including `git submodule`), `git-sync` (a bash script that runs git), `gh`
+(`api`, `search prs`, `repo sync`, `repo clone`), `ghq list`, the lockfile tools listed below, and the Python standard library. `run.ALLOWED` enforces this: any other command
 (`gh models`, `gh copilot`, `curl`, an AI CLI, ...) is refused, and tests check
 that the code imports only the standard library and has no dependencies.
 
 **One command does it all.** Plain `syncghrepo`, in one run:
 
-1. discovers repos (`gh`) and clones (`ghq` and the roots);
-2. saves and syncs every clone with git-sync (secret skip, `wip/` branch, backup ref);
-3. runs `gh repo sync` for forks;
-4. writes or refreshes the gh-dash config;
-5. prints the open-work report.
+1. discovers repos (`gh`) and clones (`ghq` and the roots), plus git repos nested
+   inside clones and submodules;
+2. clones each repo of yours that has no clone anywhere yet into
+   `~/code/GitHub/<name>` ([Missing clones](#missing-clones));
+3. saves and syncs every clone, nested ones too, with git-sync (secret skip, `wip/`
+   branch, backup ref), and runs `git submodule update --init --recursive` where a
+   `.gitmodules` exists ([Nested repos](#nested-repos-and-submodules));
+4. runs `gh repo sync` for forks;
+5. writes or refreshes the gh-dash config;
+6. prints the open-work report.
 
-It changes your repos. Two flags only: `--dry-run` previews all of it and changes
+It changes your repos. Three flags only: `--dry-run` previews all of it and changes
 nothing; `--json` prints the report as JSON (`schema_version` 1, for
-reconcile-tasks). No subcommands; see [Use](#use) for the two environment variables.
+reconcile-tasks); `--api` works through the GitHub API alone and touches no local
+clone ([API-only mode](#api-only-mode---api)). No subcommands; see [Use](#use) for
+the two environment variables.
 
 ## What it does, per clone
 
@@ -87,6 +94,65 @@ it and reports what happened:
 `$SYNCGHREPO_ROOTS` is set, from exactly those folders instead. syncghrepo only lists: it never changes `ghq.root`,
 runs `ghq get` or moves a clone. Without ghq, the roots alone are used.
 
+## Missing clones
+
+Every repo of yours (owned by the `gh` user) that has **no clone anywhere under the
+roots** is cloned with `gh repo clone owner/name ~/code/GitHub/<name>`. A clone
+counts wherever it is: under `~/code`, in ghq, nested inside another clone, or as a
+submodule; clones are matched by their `origin` URL. Archived repos are cloned too,
+and marked `archived` in the report. Organisation repos and repos you only
+collaborate on or contributed to are not cloned.
+
+An existing folder is never overwritten or moved: if `~/code/GitHub/<name>` exists
+and is not a clone of that repo (another repo, a plain folder, a file), the repo is
+skipped and reported (`clone_skipped`, exit 1) for you to sort out. Cloning only
+happens with the default roots (ghq + `~/code`) and when `gh` listed all your repos
+and ghq worked: with `$SYNCGHREPO_ROOTS` set, syncghrepo cannot know whether a repo
+is cloned elsewhere, so it clones nothing. `--dry-run` lists exactly which repos
+would be cloned and where.
+
+## Nested repos and submodules
+
+Git repos inside other clones are synced too: nested clones (a folder with its own
+`.git`, searched 4 levels into each clone, skipping hidden and build folders) and
+initialized submodules (from `git submodule status --recursive`, wherever they are).
+Each one goes through the same per-clone steps as a top-level clone (secret skip,
+`wip/` branch off the default branch, opt-in, git-sync check, backup ref), after
+its parent. A repo that is both nested and a top-level clone (e.g. listed in
+`$SYNCGHREPO_ROOTS`) is processed once. Linked worktrees inside a clone are not
+nested repos; they are listed under their main clone.
+
+- **Submodules.** In a clone with a `.gitmodules`, after it is synced, `git submodule
+  update --init --recursive` runs when a submodule is missing or not at the
+  recorded commit. It is skipped (and the reason noted) if it could move local work:
+  a submodule on a branch, with uncommitted changes, with commits on no remote, or
+  in a merge conflict. A submodule on a detached HEAD with nothing unsaved is
+  `up-to-date`, not `skipped`.
+- **Untracked nested clones.** A nested clone that the parent does not ignore would
+  be embedded by `git add -A` as a gitlink, so the parent is held back (`held_back`
+  reason "a nested git repo") until the folder is in `.gitignore` or made a
+  submodule. The nested clone itself is still synced.
+
+## API-only mode (`--api`)
+
+`syncghrepo --api` minimises disk writes: it works purely through the GitHub API
+and writes nothing but its report to stdout. It runs no git, no clone and no fetch,
+does not read or touch local clones (no roots, no ghq, no git-sync), and writes no
+gh-dash config. It:
+
+- runs `gh repo sync owner/name` for your forks that you can push to (a server-side
+  fast-forward from the parent; no disk). With `--dry-run` it does not;
+- reports open PRs, drafts, review requests, failing CI on the default branch,
+  issues assigned to you, and **stale branches on GitHub** (no commits for 30 days,
+  not the default branch, no open PR; in your own, your organisations' and
+  collaboration repos).
+
+**It cannot save or sync local work**: uncommitted changes, unpushed commits, stashes
+and local branches are not seen at all. Run plain `syncghrepo` for that.
+`--api` works with `--json` (same schema, `mode` is `api`, every repo's `clones`
+is empty) and `--dry-run`. Exit status: 2 for an error or a failed fork sync, 1 for
+failing CI, else 0.
+
 **Review UI.** Every run writes or refreshes a
 [gh-dash](https://github.com/dlvhdr/gh-dash) config with sections for your open
 PRs, your drafts, review requests and issues assigned to you, all scoped to the
@@ -113,6 +179,7 @@ uv tool install git+https://github.com/benpshore/syncghrepo
 syncghrepo --dry-run           # preview: exactly what would be committed, pushed, resolved
 syncghrepo                     # do it all: save, sync, refresh gh-dash, report
 syncghrepo --json              # the same, report as JSON (with --dry-run too)
+syncghrepo --api               # GitHub API only: sync forks on GitHub, report; no local clone touched
 gh dash                        # then review your PRs and issues
 SYNCGHREPO_ROOTS=~/code/GitHub/proj syncghrepo   # one clone (colon-separated list)
 ```
@@ -138,7 +205,8 @@ but not a guarantee.
 
 **Exit status:** 0 when all is fine (open PRs are reported, not counted); 1 when
 something needs attention: uncommitted work, a conflict, a held-back file, a clone
-mid-merge/rebase or detached, or failing CI on a default branch; 2 for an error (a
+mid-merge/rebase or detached (a clean submodule is fine), a repo of yours whose clone
+folder is taken, or failing CI on a default branch; 2 for an error (a
 step failed, `gh` or git-sync unusable, bad arguments).
 
 The JSON report is documented below.
@@ -169,9 +237,12 @@ unresolved work whose `id` stays the same across runs while the work is the same
 | `generated_at` | string | UTC time, ISO 8601 |
 | `user` | string or null | GitHub login, null if GitHub was not used |
 | `dry_run` | bool | true with `--dry-run`, else false |
+| `mode` | string | `local` (the normal run) or `api` (`--api`: GitHub only, no clones) |
 | `roots` | [string] | folders searched for clones |
 | `ghq_clones` | int or null | clones found with `ghq list -p`; null when ghq was not used (`$SYNCGHREPO_ROOTS` set) or is not installed |
 | `gh_dash` | object or null | the gh-dash config: `path`, `written` (false with `--dry-run`), `existing_config` (a `config.yml` of your own is there, so `path` is `config.syncghrepo.yml`); null without GitHub |
+| `cloned` | [clone record] | repos of yours with no clone yet, below (`[]` with `--api` or `$SYNCGHREPO_ROOTS`) |
+| `nested` | [nested repo] | git repos nested inside clones and submodules, below (`[]` with `--api`) |
 | `summary` | object | counts, below |
 | `items` | [item] | unresolved work, below |
 | `repos` | [repo] | full detail per repo, below |
@@ -210,6 +281,9 @@ Every item has exactly these keys; absent values are `null` (`flags` is `[]`).
 | `stale_branch` | `path:branch` | no commits for 30 days |
 | `stash` | `path:commit` | a git stash |
 | `worktree` | `path` | linked worktree (listed, not auto-saved) |
+| `remote_stale_branch` | `owner/name:branch` | `--api`: branch on GitHub with no commits for 30 days and no open PR |
+| `fork_sync_failed` | `owner/name` | `--api`: `gh repo sync` failed for a fork; `detail` says why |
+| `clone_skipped` | `owner/name` | a repo of yours with no clone, not cloned because its folder is taken; `path` is the folder |
 
 ### `summary`
 
@@ -217,7 +291,11 @@ Integers unless noted: `repos`, `on_github`, `cloned`, `not_cloned`, `clones`,
 `clone_status` (object: status → count), `saved_files`, `held_back_files`,
 `auto_resolved`, `conflicts`, `open_prs`, `draft_prs`, `prs_needing_review`,
 `ci_failing`, `assigned_issues`, `stashes`, `unpushed_branches`, `stale_branches`,
-`needs_attention` (repos with any `attention`), `items` (object: kind → count).
+`needs_attention` (repos with any `attention`), `items` (object: kind → count),
+`remote_stale_branches` (`--api`), `forks_synced` (`gh repo sync` runs that
+succeeded), `new_clones` (cloned, or would be with `--dry-run`), `clones_skipped`,
+`nested` (nested repos processed). With `--api` the clone counts (`cloned`,
+`not_cloned`, `clones`, `new_clones`, ...) are all 0: clones are not looked at.
 
 ### `repos[]`
 
@@ -229,12 +307,18 @@ Integers unless noted: `repos`, `on_github`, `cloned`, `not_cloned`, `clones`,
 - `remote` (object or null, from GitHub): `name`, `url`, `fork`, `archived`,
   `parent` (`owner/name` or null), `can_push`, `default_branch`, `ci` (`success`,
   `failure`, `error`, `pending`, `expected` or null), `ci_commit`, `open_prs` (total),
-  `assigned_issues_total`, `prs` and `assigned_issues` (first 50 each).
+  `assigned_issues_total`, `prs` and `assigned_issues` (first 50 each),
+  `stale_branches` (`--api` only, else null): each `name`, `age_days`,
+  `committed_at` (ISO 8601), `url`.
   - each PR: `number`, `title`, `url`, `author`, `mine`, `draft`,
     `review_decision` (GitHub's, or null), `review_requested` (from you),
     `needs_review`, `updated_at`.
   - each issue: `number`, `title`, `url`, `updated_at`.
-- `clones` ([clone]): every local clone of the repo.
+- `clones` ([clone]): every local clone of the repo, nested ones included (always
+  `[]` with `--api`).
+- `fork_sync` (object or null): `--api` only, for your forks: `cmd`, `ok` (null with
+  `--dry-run`), `note` (gh's message). In a normal run forks are synced per clone
+  (see `actions`), and this is null.
 
 ### `clones[]`
 
@@ -259,6 +343,17 @@ Integers unless noted: `repos`, `on_github`, `cloned`, `not_cloned`, `clones`,
   `age_days`, `gone`, `stale`.
 - `stashes`: each `commit`, `ref` (`stash@{N}`), `message`, `created` (ISO 8601).
 - `worktrees`: [string] paths of linked worktrees.
+- `nested_in`: path of the clone this repo is nested in, or null for a top-level
+  clone; `submodule` (bool): it is a submodule there.
+
+### `cloned[]` and `nested[]`
+
+- `cloned[]`, one per repo of yours with no clone: `name`, `path` (where it is, or
+  would be, cloned), `archived`, `fork`, `status` (`would-clone` with `--dry-run`,
+  `cloned`, `failed`, or `skipped` when the folder is taken), `note`.
+- `nested[]`, one per nested repo processed: `path`, `parent` (the enclosing clone),
+  `repo` (`owner/name`, or the folder name off GitHub), `submodule`, `status` (the
+  clone status, as in `clones[]`).
 
 ## Checks
 

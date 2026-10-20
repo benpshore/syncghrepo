@@ -243,11 +243,12 @@ def test_ghq_missing_or_failing(tmp_path, clone, monkeypatch, capsys):
     assert json.loads(capsys.readouterr().out)["errors"] == ["ghq list -p failed: boom"]
 
 
-def test_the_two_flags():
+def test_the_three_flags():
     assert cli.parse_args([]).dry_run is False  # the bare command does it all
+    assert cli.parse_args([]).api is False
     assert cli.parse_args(["--dry-run"]).dry_run is True
-    args = cli.parse_args(["--json", "--dry-run"])
-    assert args.json is True and args.dry_run is True
+    args = cli.parse_args(["--json", "--dry-run", "--api"])
+    assert args.json is True and args.dry_run is True and args.api is True
 
 
 @pytest.mark.parametrize(
@@ -265,9 +266,11 @@ def test_help_describes_the_one_command(capsys):
     with pytest.raises(SystemExit):
         cli.parse_args(["--help"])
     out = capsys.readouterr().out
-    assert "usage: syncghrepo [-h] [--dry-run] [--json] [--version]\n" in out
-    for text in ("--dry-run", "--json", "git-sync", "gh repo sync", "gh-dash",
-                 "SYNCGHREPO_ROOTS", "SYNCGHREPO_GIT_SYNC", "Exit status: 0"):  # fmt: skip
+    assert "usage: syncghrepo [-h] [--dry-run] [--json] [--api] [--version]\n" in out
+    for text in ("--dry-run", "--json", "--api", "git-sync", "gh repo sync", "gh-dash",
+                 "gh repo clone", "git submodule update --init --recursive",
+                 "cannot save or sync local", "SYNCGHREPO_ROOTS", "SYNCGHREPO_GIT_SYNC",
+                 "Exit status: 0"):  # fmt: skip
         assert text in out
 
 
