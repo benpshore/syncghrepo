@@ -1,25 +1,56 @@
-"""One clone, start to finish: save, sync, clean conflicts, push.
+"""One clone: secret check, opt in, back up, call git-sync, clean up, report.
 
-Order: gh repo sync (forks) -> git fetch --prune -> auto-save WIP commit ->
-git pull --rebase --autostash (trivial conflicts resolved, else aborted) ->
-fast-forward the default branch if it is not checked out -> push.
+git-sync (simonthum/git-sync) does the actual auto-commit, fetch, fast-forward or
+rebase, and push; syncghrepo does not reimplement it. Around it, syncghrepo:
 
-Never loses work: a backup ref (refs/syncghrepo/backup/<ts>) is made before every
-rewrite, nothing is reset or discarded, and the only forced push is
---force-with-lease on wip/ branches. With dry_run nothing is written: every step
-is listed as it would run, and conflicts are predicted in a scratch object store.
+- skips the clone if any changed file looks like a secret or is huge;
+- never runs git-sync on the default branch: work found there moves to a new
+  wip/<YYYYMMDD>-<host> branch, which is pushed and opted in; the default branch
+  itself is only ever fast-forwarded;
+- opts a branch in (branch.<b>.sync, branch.<b>.syncNewFiles) only when it has
+  something to sync and you can push;
+- runs git-sync's read-only check first, so a clone it would refuse is untouched;
+- makes a backup ref (refs/syncghrepo/backup/<ts>) of HEAD plus any uncommitted
+  work before git-sync rebases;
+- if git-sync's rebase stops on conflicts, resolves trivial ones and reruns
+  git-sync to push, or aborts the rebase: a branch is never left mid-rebase.
+
+Nothing is ever forced, reset, cleaned or discarded. With dry_run nothing is
+written: the steps are listed, git-sync runs only in its read-only check mode,
+and conflicts are predicted in a scratch object store.
 """
 
+import tempfile
 import time
 from datetime import datetime
 from pathlib import Path
 
-from . import local, resolve, save
+from . import gitsync, local, resolve, save
 from .run import Git, Result, Runner
 
 BACKUP_PREFIX = "refs/syncghrepo/backup"
-# These alone do not make a clone "updated".
-ROUTINE = ("git push (skipped)", "git fetch --prune", "gh repo sync")
+OPT_IN = ("sync", "syncNewFiles")
+
+
+def make_backup(git: Git, files: list[str], moment: datetime) -> tuple[str | None, str]:
+    """(ref, note). Back up HEAD plus uncommitted files; reuse a backup of the same tree."""
+    if files:
+        with tempfile.TemporaryDirectory(prefix="syncghrepo-") as tmp:
+            env = {"GIT_INDEX_FILE": str(Path(tmp, "index")), **resolve.SCRATCH_IDENTITY}
+            commit = resolve.snapshot(git, files, env)
+    else:
+        commit = git.out("rev-parse", "HEAD")
+    tree = git.out("rev-parse", f"{commit}^{{tree}}") if commit else None
+    if not tree:
+        return None, "could not snapshot the work"
+    existing = git.out("for-each-ref", "--format=%(refname) %(tree)", f"{BACKUP_PREFIX}/") or ""
+    for line in existing.splitlines():
+        ref, _, ref_tree = line.partition(" ")
+        if ref_tree == tree:
+            return ref, "an earlier backup holds the same work"
+    ref = f"{BACKUP_PREFIX}/{moment.strftime('%Y%m%dT%H%M%S')}"
+    made = git("update-ref", ref, commit, "")
+    return (ref, "backup before rebase") if made.ok else (None, made.last_line())
 
 
 def process(
@@ -30,6 +61,7 @@ def process(
     fork: str | None = None,
     dry_run: bool = True,
     fetch: bool = False,
+    git_sync: str | None = None,
     stale_days: int = 30,
     now: float | None = None,
 ) -> dict:
@@ -38,7 +70,9 @@ def process(
     now = time.time() if now is None else now
     moment = datetime.fromtimestamp(now).astimezone()
     git = Git(runner, path)
+    where = str(path)
     actions: list[dict] = []
+    changed = {"any": False}
     report: dict = {
         "saved": None,
         "held_back": [],
@@ -46,22 +80,60 @@ def process(
         "resolved": [],
         "conflicts": [],
         "backup_refs": [],
+        "git_sync": None,
         "actions": actions,
     }
 
-    def act(cmd: str, result: Result | None = None, note: str = "", ok: bool | None = None):
+    def act(cmd, result: Result | None = None, note="", ok=None, change=False):
         if result is not None:
             ok = result.ok
             if not result.ok:
                 note = f"{note}: {result.last_line()}" if note else result.last_line()
         actions.append({"cmd": cmd, "ok": ok, "note": note})
+        if change and ok is not False:
+            changed["any"] = True
 
     def inspect() -> dict:
         return local.inspect(runner, path, stale_days=stale_days, now=now)
 
     def finish(status: str, note: str = "") -> dict:
-        return {**inspect(), **report, "status": status, "note": note, "fork": fork,
-                "can_push": can_push}  # fmt: skip
+        extra = {"status": status, "note": note, "fork": fork, "can_push": can_push}
+        return {**inspect(), **report, **extra}
+
+    def done() -> dict:
+        if report["conflicts"]:
+            if dry_run:
+                return finish("conflict", "predicted conflicts; the rebase would be aborted")
+            return finish("conflict", "unresolved conflicts; rebase aborted, nothing lost")
+        if any(action["ok"] is False for action in actions):
+            return finish("error", next(a["note"] for a in actions if a["ok"] is False))
+        if report["save_skipped"]:
+            return finish("held-back", report["save_skipped"])
+        if changed["any"]:
+            return finish("would-update" if dry_run else "updated")
+        return finish("up-to-date")
+
+    def fast_forward_default(branch: str | None) -> None:
+        """Fast-forward the default branch when it is not checked out here."""
+        default = info["default_branch"]
+        if not default or branch == default:
+            return
+        if not git("show-ref", "--quiet", "--verify", f"refs/heads/{default}").ok:
+            return
+        tracking = f"refs/remotes/origin/{default}"
+        lag = git.out("rev-list", "--count", f"refs/heads/{default}..{tracking}")
+        if lag and lag != "0" and git("merge-base", "--is-ancestor", default, tracking).ok:
+            cmd, note = (
+                f"git fetch . origin/{default}:{default}",
+                f"fast-forward {default} by {lag}",
+            )
+            # git refuses non-fast-forwards and branches checked out in any worktree.
+            fetched = (
+                None
+                if dry_run
+                else git("fetch", "--quiet", ".", f"{tracking}:refs/heads/{default}")
+            )
+            act(cmd, fetched, note, change=True)
 
     info = inspect()
     if info["busy"]:
@@ -71,169 +143,180 @@ def process(
     if not info["head"]:
         return finish("skipped", f"no commits yet on {info['branch']}; left alone")
 
-    # 0. Secret check: a hit skips the whole clone (nothing saved, synced or pushed).
+    # 1. Secret check: a hit skips the whole clone (nothing saved, synced or pushed).
     report["held_back"] = save.held_back(git, path)
     if report["held_back"]:
         files = ", ".join(h["path"] for h in report["held_back"][:5])
         return finish("held-back", f"secret-looking or oversized files ({files}); clone skipped")
 
-    # 1. Forks: bring the fork on GitHub up to date with its parent (never --force).
+    # 2. Forks: bring the fork on GitHub up to date with its parent (never --force).
     if fork and can_push:
         cmd = f"gh repo sync {fork}"
-        act(cmd) if dry_run else act(cmd, runner(["gh", "repo", "sync", fork], str(path)))
+        act(cmd) if dry_run else act(cmd, runner(["gh", "repo", "sync", fork], where))
 
-    # 2. Fetch. Without fetch, a dry run uses remote-tracking refs as of the last fetch.
+    # 3. Fetch. Without fetch, a dry run uses remote-tracking refs as of the last fetch.
     if not dry_run or fetch:
         act("git fetch --prune", git("fetch", "--quiet", "--prune"))
         info = inspect()
-    default = info["default_branch"]
-    branch = info["branch"]
+    branch, upstream = info["branch"], info["upstream"]
+    ahead, behind = info["ahead"] or 0, info["behind"] or 0
+    files = save.changed_paths(git) or []
+    if len(files) > save.MAX_FILES:
+        report["save_skipped"] = (
+            f"{len(files)} files changed (over {save.MAX_FILES}; missing .gitignore?)"
+        )
+        return done()
+    protected = local.is_protected(branch, info["default_branch"])
 
-    # 3. Auto-save uncommitted work.
-    saving = save.plan(git, path, info, moment.strftime("%Y%m%d"))
-    new_commits = 0
-    if saving:
-        report["save_skipped"] = saving["skipped"]
-        if saving["files"] and not saving["skipped"]:
-            target = saving["branch"]
-            label = f"git commit {len(saving['files'])} file(s) on {target}"
-            report["saved"] = {"branch": target, "files": saving["files"], "commit": None}
-            if dry_run:
-                if saving["new_branch"]:
-                    act(f"git switch -c {target}", note=f"never commit to {branch}")
-                act(label, note="WIP commit")
-                branch, new_commits = target, 1
-            else:
-                result = save.commit(git, saving, moment.isoformat(timespec="seconds"))
-                act(label, result, "WIP commit")
-                if not result.ok:
-                    return finish("error", "auto-save failed; nothing else done")
-                report["saved"]["commit"] = git.out("rev-parse", "--short", "HEAD")
-                info = inspect()
-                branch = info["branch"]
-    created = bool(saving and saving["new_branch"])
+    # 4a. The default branch with no uncommitted work: fast-forward only, never git-sync.
+    if protected and not files:
+        if upstream and ahead and behind:
+            act(
+                "git merge --ff-only (skipped)",
+                note=f"{branch} diverged from {upstream} ({ahead} ahead, {behind} behind)",
+            )
+        elif upstream and ahead:
+            act("git push (skipped)", note=f"{ahead} local commit(s) on {branch} are not pushed")
+        elif upstream and behind:
+            merged = None if dry_run else git("merge", "--ff-only", "--quiet", upstream)
+            act(f"git merge --ff-only {upstream}", merged, f"fast-forward by {behind}", change=True)
+        elif not upstream and info["unpushed"]:
+            act(
+                "git push (skipped)",
+                note=f"{info['unpushed']} local commit(s) on {branch} are not pushed",
+            )
+        return done()
 
-    # 4. Sync the current branch from its upstream.
-    upstream = None if (dry_run and created) else info["upstream"]
-    behind = info["behind"] or 0
-    ahead = (info["ahead"] or 0) + new_commits
-    if upstream and behind:
-        pull = "git pull --rebase --autostash"
-        note = f"{behind} new commit(s) from {upstream}"
-        backup = f"{BACKUP_PREFIX}/{moment.strftime('%Y%m%dT%H%M%S')}"
+    pending = ahead if upstream else (info["unpushed"] or 0)
+    if not (files or pending or behind):
+        fast_forward_default(branch)
+        return done()
+
+    # 4b. Something to sync. Can git-sync do it?
+    if info["upstream_gone"] and not protected:
+        act("git-sync (skipped)", note="upstream branch was deleted (merged?); not recreating it")
+        fast_forward_default(branch)
+        return done()
+    if not can_push:
+        act("git-sync (skipped)", note="no known push access; local work left as is")
+        fast_forward_default(branch)
+        return done()
+    if not git_sync:
+        act("git-sync (skipped)", ok=False, note="git-sync not found; see --git-sync")
+        return done()
+    remote = git.out("config", f"branch.{branch}.remote")
+    if upstream and not protected and upstream != f"{remote}/{branch}":
+        act(
+            "git-sync (skipped)",
+            note=f"upstream {upstream} is not {remote}/{branch}; git-sync needs the same name",
+        )
+        return done()
+
+    # git-sync's own read-only check: refuses staged changes, odd file states, ...
+    if remote:
+        check = runner([git_sync, "-s", "-n", "check"], where)
+        act("git-sync -s -n check", ok=check.ok, note=gitsync.summary(check))
+        if not check.ok:
+            report["git_sync"] = {"code": check.code, "log": gitsync.log(check)}
+            return done()
+
+    # 5. Work on the default branch moves to a new wip/ branch first.
+    if protected:
+        target = save.wip_branch(git, moment.strftime("%Y%m%d"))
+        switched = None if dry_run else git("switch", "--quiet", "-c", target)
+        act(f"git switch -c {target}", switched, f"never commit to {branch}", change=True)
+        if switched is not None and not switched.ok:
+            return done()
+        branch, upstream, behind, pending = target, None, 0, 0
+    if not upstream:  # git-sync needs a same-named remote branch: create it
+        pushed = (
+            None if dry_run else git("push", "--quiet", "-u", "origin", f"HEAD:refs/heads/{branch}")
+        )
+        act(
+            f"git push -u origin HEAD:refs/heads/{branch}",
+            pushed,
+            "create the remote branch",
+            change=True,
+        )
+        if pushed is not None and not pushed.ok:
+            return done()
+        pending = 0
+    fast_forward_default(branch)
+
+    # 6. Opt the branch in (never the default branch: we are not on it any more).
+    for key in OPT_IN:
+        name = f"branch.{branch}.{key}"
+        if git.out("config", "--bool", "--get", name) != "true":
+            set_ = None if dry_run else git("config", "--bool", name, "true")
+            act(f"git config --bool {name} true", set_, "opt in for git-sync")
+
+    # 7. Back up before a possible rebase, and predict it in a dry run.
+    if behind and (files or pending):
+        what = f"HEAD + {len(files)} uncommitted file(s)" if files else "HEAD"
         if dry_run:
-            if ahead:
-                act(f"git update-ref {backup} HEAD", note="backup before rebase")
+            act(f"git update-ref {BACKUP_PREFIX}/<ts> <{what}>", note="backup before rebase")
             with resolve.scratch(git) as env:
-                mine = resolve.snapshot(git, saving["files"], env) if new_commits else "HEAD"
+                mine = resolve.snapshot(git, files, env) if files else "HEAD"
                 predicted = resolve.predict(git, upstream, mine or "HEAD", env)
-            if predicted is None:
-                note += "; conflicts could not be predicted"
-            else:
+            if predicted:
                 report["resolved"], report["conflicts"] = predicted
-                if report["conflicts"]:
-                    files = ", ".join(c["path"] for c in report["conflicts"])
-                    note += f"; would abort on conflicts in {files} and leave the branch as is"
-                elif report["resolved"]:
-                    note += f"; would auto-resolve {len(report['resolved'])} conflict(s)"
-            act(pull, note=note)
         else:
-            existing = git.out(
-                "for-each-ref", "--points-at", "HEAD", "--format=%(refname)",
-                f"{BACKUP_PREFIX}/",
-            )  # fmt: skip
-            if ahead and existing:  # an earlier run already backed up this exact commit
-                report["backup_refs"].append(existing.splitlines()[0])
-            elif ahead:
-                made = git("update-ref", backup, "HEAD", "")
-                act(f"git update-ref {backup} HEAD", made, "backup before rebase")
-                if not made.ok:
-                    return finish("error", "could not create a backup ref; did not rebase")
-                report["backup_refs"].append(backup)
-            stashes = len(info["stashes"])
-            result = git("pull", "--rebase", "--autostash", "--quiet")
-            if result.ok:
-                act(pull, result, note)
-            elif local.busy(git) == "rebase":
-                report["resolved"], report["conflicts"] = resolve.finish_rebase(git, runner, path)
-                if report["conflicts"]:
-                    files = ", ".join(c["path"] or "?" for c in report["conflicts"])
-                    act(
-                        pull, ok=False, note=f"conflicts in {files}: aborted, branch left as it was"
-                    )
-                    act("git rebase --abort", git("rebase", "--abort"))
-                else:
-                    act(pull, ok=True, note=f"{note}; auto-resolved {len(report['resolved'])}")
-            else:
-                act(pull, result)
-            info = inspect()
-            if report["conflicts"] or local.busy(git) or not actions[-1]["ok"]:
-                return done(finish, report, actions, dry_run)  # never push after a failed pull
-            if len(info["stashes"]) > stashes:
-                act("autostash", ok=False, note="held-back changes did not reapply; see git stash")
-            branch = info["branch"] or branch
+            ref, note = make_backup(git, files, moment)
+            act(
+                f"git update-ref {ref or BACKUP_PREFIX + '/<ts>'} <{what}>", ok=bool(ref), note=note
+            )
+            if not ref:
+                return done()
+            report["backup_refs"].append(ref)
 
-    # 4b. Fast-forward the default branch when it is not checked out here.
-    if default and branch != default and git("show-ref", "--quiet", "--verify",
-                                              f"refs/heads/{default}").ok:  # fmt: skip
-        tracking = f"refs/remotes/origin/{default}"
-        lag = git.out("rev-list", "--count", f"refs/heads/{default}..{tracking}")
-        if lag and lag != "0" and git("merge-base", "--is-ancestor", default, tracking).ok:
-            cmd = f"git fetch . origin/{default}:{default}"
-            note = f"fast-forward {default} by {lag}"
-            if dry_run:
-                act(cmd, note=note)
-            else:  # refuses non-fast-forwards and branches checked out in any worktree
-                act(cmd, git("fetch", "--quiet", ".", f"{tracking}:refs/heads/{default}"), note)
+    if files:
+        report["saved"] = {"branch": branch, "files": files, "commit": None}
 
-    # 5. Push the current branch: never the default branch, never a deleted upstream.
-    if local.is_protected(branch, default):
-        pending = ahead if upstream else (info["unpushed"] or 0)
-        if pending:
-            act("git push (skipped)", note=f"{pending} local commit(s) on {branch} are not pushed")
-        return done(finish, report, actions, dry_run)
-    if info["upstream_gone"] and not created:
-        act("git push (skipped)", note="upstream branch was deleted (merged?); not recreating it")
-        return done(finish, report, actions, dry_run)
-    if not dry_run:
-        info = inspect()
-        upstream, ahead = info["upstream"], info["ahead"] or 0
-    if upstream:
-        remote = git.out("config", f"branch.{branch}.remote") or "origin"
-        merge = git.out("config", f"branch.{branch}.merge") or f"refs/heads/{branch}"
-        count, args = ahead, ["push", "--quiet", remote, f"HEAD:{merge}"]
+    # 8. git-sync.
+    if dry_run:
+        steps = [f"commit {len(files)} file(s)"] if files else []
+        if behind:
+            steps.append(
+                f"rebase onto {behind} new commit(s)"
+                if (files or pending)
+                else f"fast-forward {behind} commit(s)"
+            )
+        if files or pending:
+            steps.append("push")
+        note = ", ".join(steps)
+        if report["conflicts"]:
+            names = ", ".join(c["path"] for c in report["conflicts"])
+            note += f"; would stop on conflicts in {names}, then git rebase --abort"
+        elif report["resolved"]:
+            note += f"; would auto-resolve {len(report['resolved'])} conflict(s), rerun git-sync"
+        act("git-sync", note=note, change=True)
+        return done()
+
+    result = runner([git_sync], where)
+    report["git_sync"] = {"code": result.code, "log": gitsync.log(result)}
+    if result.ok:
+        act("git-sync", ok=True, note=gitsync.summary(result), change=gitsync.did_something(result))
+    elif local.busy(git) == "rebase":
+        report["resolved"], report["conflicts"] = resolve.finish_rebase(git, runner, path)
+        if report["conflicts"]:
+            names = ", ".join(c["path"] or "?" for c in report["conflicts"])
+            act("git-sync", ok=False, note=f"rebase stopped on conflicts in {names}")
+            act(
+                "git rebase --abort", git("rebase", "--abort"), "branch back as it was; backup kept"
+            )
+        else:
+            act(
+                "git-sync",
+                ok=True,
+                change=True,
+                note=f"rebase stopped; auto-resolved {len(report['resolved'])} conflict(s)",
+            )
+            again = runner([git_sync], where)
+            report["git_sync"] = {"code": again.code, "log": gitsync.log(again)}
+            act("git-sync", ok=again.ok, note=gitsync.summary(again), change=True)
     else:
-        count = (info["unpushed"] or 0) + new_commits
-        remote, merge = "origin", f"refs/heads/{branch}"
-        args = ["push", "--quiet", "-u", "origin", f"HEAD:{merge}"]
-    if count:
-        label = f"git {' '.join(a for a in args if a != '--quiet')}"
-        if not can_push:
-            act("git push (skipped)", note=f"{count} commit(s) not pushed: no known push access")
-        elif dry_run:
-            act(label, note=f"{count} commit(s)")
-        else:
-            result = git(*args)
-            if not result.ok and upstream and branch.startswith("wip/"):
-                expected = git.out("rev-parse", "@{upstream}") or ""
-                lease = f"--force-with-lease={merge}:{expected}"
-                act(label, note=f"rejected ({result.last_line()}); retrying with a lease")
-                args = ["push", "--quiet", lease, remote, f"HEAD:{merge}"]
-                label = f"git push {lease} {remote} HEAD:{merge}"
-                result = git(*args)
-            act(label, result, f"{count} commit(s)")
-    return done(finish, report, actions, dry_run)
+        act("git-sync", ok=False, note=f"exit {result.code}: {gitsync.summary(result)}")
 
-
-def done(finish, report: dict, actions: list[dict], dry_run: bool) -> dict:
-    if report["conflicts"]:
-        if dry_run:
-            return finish("conflict", "predicted conflicts; the pull would be aborted")
-        return finish("conflict", "unresolved conflicts; rebase aborted, nothing lost")
-    if any(action["ok"] is False for action in actions):
-        return finish("error", next(a["note"] for a in actions if a["ok"] is False))
-    if report["held_back"] or report["save_skipped"]:
-        return finish("held-back", report["save_skipped"] or "some files were not saved")
-    if any(not action["cmd"].startswith(ROUTINE) for action in actions):
-        return finish("would-update" if dry_run else "updated")
-    return finish("up-to-date")
+    if report["saved"] and not set(files) & set(save.changed_paths(git) or []):
+        report["saved"]["commit"] = git.out("rev-parse", "--short", "HEAD")
+    return done()

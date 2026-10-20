@@ -1,7 +1,7 @@
 """Run commands with a timeout. Every git, gh and lockfile command goes through a Runner.
 
 syncghrepo makes no AI/LLM calls and no network calls of its own: it is plain git,
-gh and the standard library. run() enforces that with an allowlist, so nothing
+gh, git-sync and the standard library. run() enforces that with an allowlist, so nothing
 else (e.g. `gh models`, `gh copilot`, curl, an AI CLI) can ever be started.
 """
 
@@ -23,6 +23,7 @@ QUIET = {
 # The only commands syncghrepo may run (matched as argument prefixes).
 ALLOWED = (
     ("git",),
+    ("git-sync",),  # simonthum/git-sync: auto-commit, rebase, push (plain bash + git)
     ("gh", "api"),  # user, user/repos and the fixed GraphQL query in github.py
     ("gh", "search", "prs"),
     ("gh", "repo", "sync"),
@@ -36,7 +37,11 @@ ALLOWED = (
 
 
 def allowed(cmd: Sequence[str]) -> bool:
-    return any(tuple(cmd[: len(prefix)]) == prefix for prefix in ALLOWED)
+    """Matched on the program's base name, so /path/to/git-sync counts as git-sync."""
+    if not cmd:
+        return False
+    head = (os.path.basename(cmd[0]), *cmd[1:])
+    return any(tuple(head[: len(prefix)]) == prefix for prefix in ALLOWED)
 
 
 @dataclass(frozen=True)

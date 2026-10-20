@@ -1,13 +1,13 @@
 """syncghrepo: keep all work in your local clones saved and in sync, and list
 what is still open.
 
-For every clone under the roots: auto-save uncommitted work as a WIP commit
-(on a wip/<YYYYMMDD>-<host> branch when on the default branch; ignored files are
-never added, and a secret-looking, .env or huge file skips the whole clone),
-gh repo sync forks, git pull --rebase --autostash
-with trivial conflicts auto-resolved (anything else is aborted and reported),
-then push (never the default branch). Then report open PRs, review requests,
-failing CI, assigned issues, unpushed/stale branches and stashes.
+For every clone under the roots: a secret-looking, .env or huge changed file skips
+the clone; otherwise git-sync (simonthum/git-sync) commits, rebases and pushes the
+current branch, which syncghrepo opts in. Work on the default branch first moves
+to wip/<YYYYMMDD>-<host>; the default branch is only fast-forwarded. A backup ref
+is made before any rebase; trivial conflicts are resolved, anything else aborted.
+Forks get gh repo sync. Then report open PRs, review requests, failing CI,
+assigned issues, unpushed/stale branches and stashes.
 
 Dry run by default: nothing is written until you pass --apply.
 
@@ -25,7 +25,7 @@ from datetime import UTC, datetime
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 
-from . import github, local, sync
+from . import github, gitsync, local, sync
 from .run import Runner, make_runner
 
 # Bump when a field is removed or renamed, or its type or meaning changes; new fields
@@ -79,6 +79,11 @@ def parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
         metavar="DIR",
         help="clone, or folder of clones; repeatable (default: $SYNCGHREPO_ROOTS or ~/code)",
     )
+    parser.add_argument(
+        "--git-sync",
+        metavar="PATH",
+        help="git-sync to run (default: $SYNCGHREPO_GIT_SYNC, PATH, ~/.local/bin/git-sync)",
+    )
     parser.add_argument("--depth", type=int, default=3, help="how deep to search roots (3)")
     parser.add_argument("--json", action="store_true", help="print the full report as JSON")
     parser.add_argument(
@@ -106,7 +111,7 @@ def clone_items(clone: dict) -> list[str]:
         if action["ok"] is False:
             items.append(f"{action['cmd']} failed: {action['note']}")
         elif action["cmd"].endswith("(skipped)"):
-            items.append(f"not pushed: {action['note']}")
+            items.append(f"not synced: {action['note']}")
     if clone["upstream_gone"] and clone["status"] != "skipped":
         items.append(f"{clone['branch']}: upstream branch was deleted (merged?)")
     for held in clone["held_back"]:
@@ -266,7 +271,7 @@ def work_items(repos: list[dict]) -> list[dict]:
                     )
                 )
             for action in clone["actions"]:
-                if action["cmd"] == "git push (skipped)":
+                if action["cmd"].endswith("(skipped)"):
                     items.append(
                         item(
                             "not_pushed",
@@ -390,6 +395,9 @@ def build_report(args: argparse.Namespace, runner: Runner, now: float | None = N
     now = time.time() if now is None else now
     roots = [Path(root).expanduser() for root in (args.root or default_roots())]
     errors: list[str] = []
+    git_sync = gitsync.find(args.git_sync)
+    if not git_sync:
+        errors.append("git-sync not found (--git-sync, $SYNCGHREPO_GIT_SYNC, PATH, ~/.local/bin)")
     me = None
     repos: dict[str, dict] = {}
     if not args.no_github:
@@ -456,6 +464,7 @@ def build_report(args: argparse.Namespace, runner: Runner, now: float | None = N
                 fork=remote["name"] if remote.get("fork") else None,
                 dry_run=not args.apply,
                 fetch=args.fetch,
+                git_sync=git_sync,
                 stale_days=args.stale_days,
                 now=now,
             )
