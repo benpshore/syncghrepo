@@ -1,13 +1,18 @@
-"""Run commands with a timeout. Every git and gh call goes through a Runner."""
+"""Run commands with a timeout. Every git, gh and lockfile command goes through a Runner."""
 
 import os
 import signal
 import subprocess
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 
-# Never wait on a prompt: no terminal, no credential or update prompts.
-QUIET = {"GIT_TERMINAL_PROMPT": "0", "GH_PROMPT_DISABLED": "1", "GH_NO_UPDATE_NOTIFIER": "1"}
+# Never wait on a prompt: no terminal, no credential or update prompts, no editor.
+QUIET = {
+    "GIT_TERMINAL_PROMPT": "0",
+    "GIT_EDITOR": "true",
+    "GH_PROMPT_DISABLED": "1",
+    "GH_NO_UPDATE_NOTIFIER": "1",
+}
 
 
 @dataclass(frozen=True)
@@ -29,22 +34,25 @@ class Result:
         return f"exit {self.code}"
 
 
-# runner(cmd, cwd) -> Result. Tests pass a fake one.
-Runner = Callable[[Sequence[str], str | None], Result]
+# runner(cmd, cwd=None, env=None) -> Result. env adds to the environment. Tests pass a fake.
+Runner = Callable[..., Result]
 
 
-def run(cmd: Sequence[str], cwd: str | None = None, timeout: float = 60.0) -> Result:
+def run(
+    cmd: Sequence[str],
+    cwd: str | None = None,
+    timeout: float = 60.0,
+    env: Mapping[str, str] | None = None,
+) -> Result:
     """Run cmd; on timeout kill its whole process group."""
     try:
         proc = subprocess.Popen(
             list(cmd),
             cwd=cwd,
-            env={**os.environ, **QUIET},
+            env={**os.environ, **QUIET, **(env or {})},
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            text=True,
-            errors="replace",
             start_new_session=True,
         )
     except OSError as err:
@@ -56,11 +64,33 @@ def run(cmd: Sequence[str], cwd: str | None = None, timeout: float = 60.0) -> Re
             os.killpg(proc.pid, signal.SIGKILL)
             proc.communicate()
             return Result(124, "", f"{cmd[0]} timed out after {timeout:g}s")
-    return Result(proc.returncode, out, err)
+    # No newline translation, and undecodable bytes survive a round trip:
+    # out.encode("utf-8", "surrogateescape") gives back git's exact bytes.
+    return Result(proc.returncode, decode(out), decode(err))
+
+
+def decode(data: bytes) -> str:
+    return data.decode("utf-8", "surrogateescape")
 
 
 def make_runner(timeout: float) -> Runner:
-    def runner(cmd: Sequence[str], cwd: str | None = None) -> Result:
-        return run(cmd, cwd, timeout)
+    def runner(cmd: Sequence[str], cwd: str | None = None, env=None) -> Result:
+        return run(cmd, cwd, timeout, env)
 
     return runner
+
+
+class Git:
+    """git in one clone. Read commands never take optional locks or start gc."""
+
+    def __init__(self, runner: Runner, path):
+        self.runner = runner
+        self.where = str(path)
+
+    def __call__(self, *args: str, env: Mapping[str, str] | None = None) -> Result:
+        cmd = ["git", "--no-optional-locks", "-c", "gc.auto=0", *args]
+        return self.runner(cmd, self.where, env) if env else self.runner(cmd, self.where)
+
+    def out(self, *args: str, env: Mapping[str, str] | None = None) -> str | None:
+        result = self(*args, env=env)
+        return result.out.strip() if result.ok else None

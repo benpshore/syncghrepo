@@ -12,7 +12,7 @@ REPO_FIELDS = (
 STATUS_QUERY = """
 query($owner: String!, $name: String!, $me: String!) {
   repository(owner: $owner, name: $name) {
-    nameWithOwner url isFork isArchived
+    nameWithOwner url isFork isArchived viewerPermission
     parent { nameWithOwner }
     defaultBranchRef { name target { ... on Commit { oid statusCheckRollup { state } } } }
     pullRequests(states: OPEN, first: 50, orderBy: {field: UPDATED_AT, direction: DESC}) {
@@ -29,6 +29,9 @@ query($owner: String!, $name: String!, $me: String!) {
   }
 }
 """
+
+
+PUSH_PERMISSIONS = frozenset({"WRITE", "MAINTAIN", "ADMIN"})
 
 
 class GhError(RuntimeError):
@@ -163,6 +166,7 @@ def repo_status(runner: Runner, name: str, me: str, *, all_prs: bool = True) -> 
         "fork": data["isFork"],
         "archived": data["isArchived"],
         "parent": (data.get("parent") or {}).get("nameWithOwner"),
+        "can_push": data.get("viewerPermission") in PUSH_PERMISSIONS,
         "default_branch": ref.get("name"),
         "ci": (rollup.get("state") or "").lower() or None,
         "ci_commit": (commit.get("oid") or "")[:7] or None,
