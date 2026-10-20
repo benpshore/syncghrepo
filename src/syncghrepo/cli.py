@@ -1,18 +1,22 @@
 """syncghrepo: keep all work in your local clones saved and in sync, and list
-what is still open.
+what is still open. One command does it all:
 
-  syncghrepo         status: what is open and what sync would do; writes nothing
-  syncghrepo sync    save and sync every clone (git-sync), then the same report
-  syncghrepo dash    write a gh-dash config for your PRs and issues, print the command
+  syncghrepo              discover, save and sync, refresh gh-dash, report
+  syncghrepo --dry-run    the same, as a preview: nothing is changed or written
+  syncghrepo --json       the report as JSON (schema_version 1), e.g. for reconcile-tasks
 
-Clones come from ghq (ghq list -p) plus ~/code, or only $SYNCGHREPO_ROOTS
-(colon-separated) when set. A secret-looking, .env or huge changed file skips a
-clone; otherwise git-sync (simonthum/git-sync) commits, rebases and pushes the
-current branch, which syncghrepo opts in. Work on the default branch first moves to
-wip/<YYYYMMDD>-<host>; the default branch is only fast-forwarded. A backup ref is
-made before any rebase; trivial conflicts are resolved, anything else aborted.
-Forks get gh repo sync. The report lists open PRs, review requests, failing CI,
-assigned issues, unpushed/stale branches and stashes.
+Every run:
+  1. discovers repos (gh) and clones (ghq list -p plus ~/code, or only
+     $SYNCGHREPO_ROOTS, colon-separated, when set);
+  2. saves and syncs each clone with git-sync (simonthum/git-sync): a
+     secret-looking, .env or huge changed file skips the clone; work on the
+     default branch moves to wip/<YYYYMMDD>-<host> (the default branch is only
+     fast-forwarded); a backup ref is made before any rebase; trivial conflicts
+     are resolved, anything else aborted;
+  3. runs gh repo sync for forks you can push to;
+  4. writes or refreshes the gh-dash config (never launches gh dash);
+  5. prints the open-work report: PRs, review requests, failing CI, assigned
+     issues, unpushed/stale branches, stashes.
 
 Exit status: 0 all fine; 1 needs attention (uncommitted work, a conflict, a
 held-back file, a clone mid-merge/rebase, failing CI); 2 an error.
@@ -38,7 +42,6 @@ from .run import Runner, make_runner
 # may be added without a bump (consumers ignore unknown keys). See README "JSON schema".
 SCHEMA_VERSION = 1
 PROBLEMS = ("conflict", "error", "held-back")  # clone statuses listed in attention
-COMMANDS = ("sync", "dash")
 # Fixed settings (formerly flags).
 DEPTH = 3  # how deep to search a root for clones
 STALE_DAYS = 30  # branch age that counts as stale
@@ -74,13 +77,13 @@ def parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument(
-        "command",
-        nargs="?",
-        choices=COMMANDS,
-        metavar="sync|dash",
-        help="sync: save and sync; dash: write the gh-dash config (default: status)",
+        "--dry-run",
+        action="store_true",
+        help="preview: show what would be committed, synced and written; change nothing",
     )
-    parser.add_argument("--json", action="store_true", help="print the result as JSON")
+    parser.add_argument(
+        "--json", action="store_true", help="print the report as JSON (schema_version 1)"
+    )
     parser.add_argument("--version", action="version", version=f"%(prog)s {tool_version()}")
     return parser.parse_args(argv)
 
@@ -423,9 +426,9 @@ def discover(runner: Runner) -> dict:
 
 
 def build_report(args: argparse.Namespace, runner: Runner, now: float | None = None) -> dict:
-    """The status report; with args.command == "sync", after saving and syncing."""
+    """Save and sync every clone, refresh the gh-dash config, report (preview if dry_run)."""
     now = time.time() if now is None else now
-    apply = args.command == "sync"
+    apply = not args.dry_run
     found = discover(runner)
     roots, errors, me = found["roots"], found["errors"], found["me"]
     repos, clone_keys = found["repos"], found["clone_keys"]
@@ -488,7 +491,7 @@ def build_report(args: argparse.Namespace, runner: Runner, now: float | None = N
     gh_dash = None
     if me:
         try:
-            gh_dash = dash.save(ordered, generated_at, tool_version(), write=False)
+            gh_dash = dash.save(ordered, generated_at, tool_version(), write=apply)
         except OSError as err:
             errors.append(f"could not write the gh-dash config: {err}")
     return {
@@ -511,7 +514,11 @@ def build_report(args: argparse.Namespace, runner: Runner, now: float | None = N
 def render(report: dict) -> str:
     """Plain-text summary for a human."""
     s = report["summary"]
-    mode = "status, nothing written (syncghrepo sync to do it)" if report["dry_run"] else "synced"
+    mode = (
+        "DRY RUN, nothing changed (run without --dry-run to do it)"
+        if report["dry_run"]
+        else "synced"
+    )
     roots = ", ".join(local.short_path(root) for root in report["roots"])
     statuses = ", ".join(f"{n} {status}" for status, n in s["clone_status"].items()) or "none"
     lines = [
@@ -570,10 +577,8 @@ def render(report: dict) -> str:
     if report["gh_dash"]:
         where = local.short_path(report["gh_dash"]["path"])
         flag = "" if where.endswith("/config.yml") else f" --config {where}"
-        if report["gh_dash"]["written"]:
-            lines += ["", f"gh-dash config: wrote {where}; review with: gh dash{flag}"]
-        else:
-            lines += ["", f"gh-dash config: {where} (write it with: syncghrepo dash)"]
+        done = "wrote" if report["gh_dash"]["written"] else "would write"
+        lines += ["", f"gh-dash config: {done} {where}; review with: gh dash{flag}"]
     if report["errors"]:
         lines += ["", "Errors:"] + [f"  - {error}" for error in report["errors"]]
     return "\n".join(lines)
@@ -595,40 +600,8 @@ def exit_code(report: dict) -> int:
     return 1 if attention or report["summary"]["ci_failing"] else 0
 
 
-def write_dash(runner: Runner, now: float | None = None) -> dict:
-    """Write the gh-dash config for the discovered repos; never launches gh dash."""
-    now = time.time() if now is None else now
-    found = discover(runner)
-    repos = list(found["repos"].values())
-    for entry in repos:
-        entry.setdefault("clones", [])
-    for path, key in found["clone_keys"]:
-        found["repos"][key]["clones"].append({"path": str(path)})
-    stamp = datetime.fromtimestamp(now, UTC).isoformat(timespec="seconds")
-    result = {"errors": found["errors"]}
-    try:
-        result |= dash.save(repos, stamp, tool_version(), write=True)
-    except OSError as err:
-        result["errors"].append(f"could not write the gh-dash config: {err}")
-        return result
-    where = local.short_path(result["path"])
-    result["command"] = "gh dash" + ("" if where.endswith("/config.yml") else f" --config {where}")
-    return result
-
-
 def main(argv: Sequence[str] | None = None, runner: Runner | None = None) -> int:
     args = parse_args(argv)
-    runner = runner or make_runner(TIMEOUT)
-    if args.command == "dash":
-        result = write_dash(runner)
-        if args.json:
-            print(json.dumps(result, indent=2))
-        else:
-            lines = [f"error: {error}" for error in result["errors"]]
-            if "command" in result:
-                lines += [f"Wrote {local.short_path(result['path'])}", result["command"]]
-            print("\n".join(lines))
-        return 2 if result["errors"] else 0
-    report = build_report(args, runner)
+    report = build_report(args, runner or make_runner(TIMEOUT))
     print(json.dumps(report, indent=2) if args.json else render(report))
     return exit_code(report)
