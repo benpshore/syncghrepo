@@ -19,7 +19,16 @@ only `git`, `git-sync` (a bash script that runs git), `gh` (`api`, `search prs`,
 (`gh models`, `gh copilot`, `curl`, an AI CLI, ...) is refused, and tests check
 that the code imports only the standard library and has no dependencies.
 
-**Dry run by default.** Nothing is written until you pass `--apply`.
+**Three commands, one flag.**
+
+```sh
+syncghrepo           # status: what is open and what sync would do; writes nothing
+syncghrepo sync      # save and sync every clone, then the same report
+syncghrepo dash      # write the gh-dash config, then print the gh dash command
+```
+
+`--json` (any command) prints JSON instead of text. Nothing else is a flag; see
+[Use](#use) for the two environment variables.
 
 ## What it does, per clone
 
@@ -72,61 +81,66 @@ it and reports what happened:
    deleted-upstream branches, stashes and linked worktrees. Repos come from `gh`:
    yours, your organisations', collaborations, and repos you opened PRs in.
 
-**Finding clones.** Clones come from the roots (`~/code` or `$SYNCGHREPO_ROOTS`)
-and, unless `--root` is given, from [ghq](https://github.com/x-motemen/ghq)
-(`ghq list -p`), deduplicated. syncghrepo only lists: it never changes `ghq.root`,
+**Finding clones.** Clones come from [ghq](https://github.com/x-motemen/ghq)
+(`ghq list -p`) plus `~/code` (searched 3 levels deep), deduplicated; if
+`$SYNCGHREPO_ROOTS` is set, from exactly those folders instead. syncghrepo only lists: it never changes `ghq.root`,
 runs `ghq get` or moves a clone. Without ghq, the roots alone are used.
 
-**Review UI.** With `--apply`, syncghrepo writes a
+**Review UI.** `syncghrepo dash` writes a
 [gh-dash](https://github.com/dlvhdr/gh-dash) config with sections for your open
 PRs, your drafts, review requests and issues assigned to you, all scoped to the
 discovered repos (`repo:owner/name ...`), plus `repoPaths` so gh dash can check a PR
 out in your clone. It goes to `~/.config/gh-dash/config.yml` (or
 `$XDG_CONFIG_HOME/gh-dash/`) only if no file is there; otherwise next to it as
 `config.syncghrepo.yml`, so your own config is never touched (then:
-`gh dash --config ~/.config/gh-dash/config.syncghrepo.yml`). syncghrepo never
-launches `gh dash`.
+`gh dash --config ~/.config/gh-dash/config.syncghrepo.yml`), and prints the
+`gh dash` command to run. It only discovers repos and clones (no syncing), and
+never launches `gh dash`.
 
 Clones in the middle of a merge or rebase, with a detached HEAD, or with no
 commits yet, are left alone and reported. Linked worktrees are listed but not
 synced. Nothing is ever reset, cleaned, force-pushed or discarded.
 
-git-sync is found via `--git-sync PATH`, `$SYNCGHREPO_GIT_SYNC`, `PATH`, then
+git-sync is found via `$SYNCGHREPO_GIT_SYNC`, `PATH`, then
 `~/.local/bin/git-sync`. Without it, clones with work are reported, not synced,
-and the run exits 1. To stop syncing a branch: `git config --unset branch.<b>.sync`.
+and the run exits 2. To stop syncing a branch: `git config --unset branch.<b>.sync`.
 
 ## Use
 
 ```sh
 uv tool install git+https://github.com/benpshore/syncghrepo
-syncghrepo                     # dry run: exactly what would be committed, pushed, resolved
-syncghrepo --fetch             # dry run against what is on the remotes now
-syncghrepo --apply             # do it
-syncghrepo --json              # full report for agents (works with --apply too)
-syncghrepo --root ~/code/GitHub/proj --apply   # one clone; --root is repeatable
-syncghrepo --no-github         # no gh calls: local work only, nothing pushed
-syncghrepo --git-sync ~/.local/bin/git-sync --apply   # explicit git-sync
+syncghrepo                     # status: exactly what sync would commit, push, resolve
+syncghrepo sync                # do it
+syncghrepo --json              # full report for agents (works with sync too)
+syncghrepo dash && gh dash     # review your PRs and issues
+SYNCGHREPO_ROOTS=~/code/GitHub/proj syncghrepo sync   # one clone (colon-separated list)
 ```
+
+Environment: `SYNCGHREPO_ROOTS` (folders of clones, colon-separated, instead of
+ghq + `~/code`); `SYNCGHREPO_GIT_SYNC` (the git-sync to run). Fixed settings: roots
+are searched 3 levels deep, a branch is stale after 30 days without commits, each
+command times out after 120 s, and 8 clones are processed in parallel.
 
 From a checkout: `uv run syncghrepo`. In a Makefile:
 
 ```make
-sync:      ; syncghrepo --apply
-sync-plan: ; syncghrepo --fetch --json > sync-plan.json
+status: ; syncghrepo
+sync:   ; syncghrepo sync
+dash:   ; syncghrepo dash
+plan:   ; syncghrepo --json > sync-plan.json
 ```
 
-A dry run writes nothing: no commits, refs, index or working-tree changes, no
-gh-dash config, and no fetch unless `--fetch` (which only updates remote-tracking refs). Conflicts are
-predicted with `git merge-tree` in a scratch object store outside the clone; a
-rebase replays commit by commit, so the prediction is close but not a guarantee.
+`syncghrepo` (status) writes nothing: no commits, refs, config, index or
+working-tree changes, no gh-dash config, and no fetch, so it works from the
+remote-tracking refs of the last fetch (`sync` fetches). git-sync runs only in its
+read-only `check` mode. Conflicts are predicted with `git merge-tree` in a scratch
+object store outside the clone; a rebase replays commit by commit, so the
+prediction is close but not a guarantee.
 
-Options: `--depth 3` (how deep to search roots, default `~/code` or
-`$SYNCGHREPO_ROOTS`, colon-separated), `--stale-days 30`, `--timeout 120` (seconds
-per command), `--jobs 8` (clones in parallel).
-
-**Exit status:** 0 when every clone is saved and in sync (open PRs and failing CI
-are reported, not failures); 1 when something needs a person (a conflict, an
-error, a held-back file, or GitHub unreachable); 2 for bad arguments.
+**Exit status:** 0 when all is fine (open PRs are reported, not counted); 1 when
+something needs attention: uncommitted work, a conflict, a held-back file, a clone
+mid-merge/rebase or detached, or failing CI on a default branch; 2 for an error (a
+step failed, `gh` or git-sync unusable, bad arguments).
 
 The JSON report is documented below.
 
@@ -155,14 +169,14 @@ unresolved work whose `id` stays the same across runs while the work is the same
 | `version` | string | syncghrepo's version |
 | `generated_at` | string | UTC time, ISO 8601 |
 | `user` | string or null | GitHub login, null if GitHub was not used |
-| `dry_run` | bool | true unless `--apply` |
+| `dry_run` | bool | true for `syncghrepo` (status), false for `syncghrepo sync` |
 | `roots` | [string] | folders searched for clones |
-| `ghq_clones` | int or null | clones found with `ghq list -p`; null when ghq was not used (`--root` given) or is not installed |
-| `gh_dash` | object or null | the gh-dash config: `path`, `written` (false in a dry run), `existing_config` (a `config.yml` was already there, so `path` is `config.syncghrepo.yml`); null without GitHub |
+| `ghq_clones` | int or null | clones found with `ghq list -p`; null when ghq was not used (`$SYNCGHREPO_ROOTS` set) or is not installed |
+| `gh_dash` | object or null | the gh-dash config: `path`, `written` (always false here: only `syncghrepo dash` writes it), `existing_config` (a `config.yml` was already there, so `path` is `config.syncghrepo.yml`); null without GitHub |
 | `summary` | object | counts, below |
 | `items` | [item] | unresolved work, below |
 | `repos` | [repo] | full detail per repo, below |
-| `errors` | [string] | run-level problems (e.g. `gh` unusable); non-empty means exit 1 |
+| `errors` | [string] | run-level problems (e.g. `gh` unusable); non-empty means exit 2 |
 
 ### `items`: unresolved work
 
@@ -194,7 +208,7 @@ Every item has exactly these keys; absent values are `null` (`flags` is `[]`).
 | `not_pushed` | `path:branch` | work not synced or pushed: commits on the default branch, a diverged default branch, deleted upstream, no push access, or a branch git-sync cannot handle |
 | `unpushed_branch` | `path:branch` | another local branch with commits on no remote |
 | `gone_branch` | `path:branch` | local branch whose upstream was deleted (merged?) |
-| `stale_branch` | `path:branch` | no commits for `--stale-days` |
+| `stale_branch` | `path:branch` | no commits for 30 days |
 | `stash` | `path:commit` | a git stash |
 | `worktree` | `path` | linked worktree (listed, not auto-saved) |
 
@@ -230,14 +244,14 @@ Integers unless noted: `repos`, `on_github`, `cloned`, `not_cloned`, `clones`,
   `untracked`, `busy` (`merge`, `rebase`, ... or null), `ahead`, `behind`,
   `unpushed` (commits on HEAD on no remote), `fork`, `can_push`. All describe the
   clone after the run.
-- `status`: `up-to-date`, `updated`, `would-update` (dry run), `held-back`,
+- `status`: `up-to-date`, `updated`, `would-update` (status), `held-back`,
   `conflict`, `error` or `skipped`; `note` explains it.
-- `actions`: each `cmd`, `ok` (true/false; null in a dry run or when skipped) and
+- `actions`: each `cmd`, `ok` (true/false; null in status or when skipped) and
   `note`.
 - `git_sync` (null if git-sync did not run, or ran only its check and passed): the
   last git-sync run's `code` (exit status: 0 in sync, 1 refused or rebase stopped,
   2 unsafe state, 3 fetch/push failed) and `log` (its last output lines).
-- `saved` (null if nothing was saved): `branch`, `files`, `commit` (null in a dry run).
+- `saved` (null if nothing was saved): `branch`, `files`, `commit` (null in status).
 - `held_back`: each `path` and `reason`. `save_skipped`: reason or null.
 - `resolved`: each `path` and `how` (`identical`, `whitespace`, `union`, `lockfile`;
   lockfiles add `regenerate`, the command). `conflicts`: each `path` and `how`

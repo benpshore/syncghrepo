@@ -20,7 +20,7 @@ CHANGED = ("Committing local changes", "Pushing changes", "fast-forwarding", "Re
 
 
 def find(explicit: str | None = None) -> str | None:
-    """The git-sync executable: --git-sync, $SYNCGHREPO_GIT_SYNC, PATH, ~/.local/bin."""
+    """The git-sync executable: explicit, $SYNCGHREPO_GIT_SYNC, PATH, ~/.local/bin."""
     for candidate in (
         explicit,
         os.environ.get(ENV),
