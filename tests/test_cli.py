@@ -1,6 +1,7 @@
 import json
 from datetime import datetime
 
+import pytest
 from conftest import FakeRunner, git, remote_head
 from test_github import pr, repo_line, status_payload
 
@@ -45,16 +46,16 @@ def point_origin_at_github(clone, name="benpshore/proj"):
     git(clone, "config", f"url.{bare}.insteadOf", url)
 
 
-def test_default_is_a_dry_run_with_json(tmp_path, origin, clone, capsys):
+def test_bare_command_is_a_read_only_status(tmp_path, origin, clone, capsys):
     point_origin_at_github(clone)
     (clone / "a.txt").write_text("edited\n")
     (tmp_path / "code" / "plain").mkdir()
     git(tmp_path / "code" / "plain", "init", "-q")
     runner = FakeRunner(gh_replies())
 
-    code = cli.main(["--root", str(tmp_path / "code"), "--json"], runner=runner)
+    code = cli.main(["--json"], runner=runner)
 
-    assert code == 0
+    assert code == 1  # uncommitted work and failing CI need attention
     report = json.loads(capsys.readouterr().out)
     assert report["user"] == "benpshore" and report["dry_run"] is True
     repos = {r["name"]: r for r in report["repos"]}
@@ -81,27 +82,41 @@ def test_default_is_a_dry_run_with_json(tmp_path, origin, clone, capsys):
         ("search", "prs"),
         ("api", "graphql"),
     }
+    # No gh-dash config either: only "syncghrepo dash" writes it.
+    target = dash.config_dir() / "config.yml"
+    assert report["gh_dash"] == {"path": str(target), "written": False, "existing_config": False}
+    assert not target.parent.exists()
 
 
-def test_apply_saves_syncs_pushes_and_summarizes(tmp_path, origin, clone, capsys):
+def test_sync_saves_syncs_pushes_and_summarizes(tmp_path, origin, clone, capsys):
     point_origin_at_github(clone)
     new_main = origin.advance()
     (clone / "a.txt").write_text("edited\n")
 
-    code = cli.main(["--root", str(tmp_path / "code"), "--apply"], runner=FakeRunner(gh_replies()))
+    code = cli.main(["sync"], runner=FakeRunner(gh_replies()))
 
     out = capsys.readouterr().out
-    assert code == 0, out
+    assert code == 1, out  # saved and synced; only the failing CI is left
     assert git(clone, "rev-parse", "main") == new_main
     assert remote_head(origin, WIP) == git(clone, "rev-parse", "HEAD")
+    assert "· synced\n" in out.splitlines()[0] + "\n"
     assert "Clones: 1 updated" in out
     assert "Saved: 1 file(s), 0 held back" in out
     assert "Done:" in out and "ok git-sync  # In sync, all fine." in out
-    config = dash.config_dir() / "config.yml"
-    assert f"gh-dash config: Wrote {local.short_path(config)}; review with: gh dash\n" in out
-    assert "assignee:@me repo:benpshore/other repo:benpshore/proj" in config.read_text()
     assert "CI failure on main (abcdef1)" in out
     assert "Not cloned, nothing open (1): benpshore/other" in out
+    config = dash.config_dir() / "config.yml"
+    assert f"gh-dash config: {local.short_path(config)} (write it with: syncghrepo dash)" in out
+    assert not config.exists()
+
+
+def test_all_fine_exits_0(tmp_path, origin, clone, capsys):
+    point_origin_at_github(clone)
+    replies = gh_replies()
+    passing = status_payload("benpshore/proj", ci="SUCCESS")
+    replies[("api", "graphql")] = lambda cmd: Result(0, passing)
+    assert cli.main(["sync"], runner=FakeRunner(replies)) == 0
+    assert cli.main([], runner=FakeRunner(replies)) == 0
 
 
 def test_read_only_permission_means_no_push(tmp_path, origin, clone, capsys):
@@ -109,7 +124,7 @@ def test_read_only_permission_means_no_push(tmp_path, origin, clone, capsys):
     git(clone, "switch", "-q", "-c", "feat")
     (clone / "a.txt").write_text("edited\n")
     runner = FakeRunner(gh_replies(proj="READ"))
-    cli.main(["--root", str(tmp_path / "code"), "--apply"], runner=runner)
+    assert cli.main(["sync"], runner=runner) == 1  # the work is still uncommitted
     assert "push" not in runner.git_subcommands()
     assert "not synced: no known push access; local work left as is" in capsys.readouterr().out
 
@@ -121,7 +136,7 @@ def test_conflict_exits_1(tmp_path, origin, clone, capsys):
     origin.advance("a.txt", "theirs\n", branch="feat")
     (clone / "a.txt").write_text("mine\n")
 
-    code = cli.main(["--root", str(tmp_path / "code"), "--apply"], runner=FakeRunner(gh_replies()))
+    code = cli.main(["sync"], runner=FakeRunner(gh_replies()))
 
     out = capsys.readouterr().out
     assert code == 1
@@ -135,7 +150,7 @@ def test_someone_elses_clone_only_shows_my_prs(tmp_path, origin, clone, capsys):
         "stranger/tool", ci="FAILURE", prs=[pr(1, "dependabot"), pr(2)], permission="READ"
     )
     replies = gh_replies() | {("api", "graphql"): lambda cmd: Result(0, payload)}
-    cli.main(["--root", str(tmp_path / "code"), "--json"], runner=FakeRunner(replies))
+    cli.main(["--json"], runner=FakeRunner(replies))
     repos = json.loads(capsys.readouterr().out)["repos"]
     tool = next(r for r in repos if r["name"] == "stranger/tool")
     assert tool["sources"] == ["local"]
@@ -143,96 +158,121 @@ def test_someone_elses_clone_only_shows_my_prs(tmp_path, origin, clone, capsys):
     assert tool["attention"] == ["PR #2 [mine]: PR 2"]
 
 
-def test_gh_unavailable_still_reports_local_and_exits_1(tmp_path, clone, capsys):
+def test_gh_unavailable_still_reports_local_and_exits_2(tmp_path, clone, capsys):
     runner = FakeRunner({("api", "user"): Result(4, "", "gh auth login required")})
-    code = cli.main(["--root", str(tmp_path / "code")], runner=runner)
+    code = cli.main([], runner=runner)
     out = capsys.readouterr().out
-    assert code == 1
+    assert code == 2
     assert "gh not usable" in out
     assert "Clean (1): proj" in out
 
 
-def test_no_github_flag_makes_no_gh_calls(tmp_path, clone, capsys):
-    runner = FakeRunner()
-    assert cli.main(["--root", str(tmp_path / "code"), "--no-github", "--json"], runner=runner) == 0
-    report = json.loads(capsys.readouterr().out)
-    assert report["user"] is None
-    assert all(cmd[0] == "git" for cmd in runner.calls)
-
-
-def test_dry_run_writes_no_gh_dash_config(tmp_path, origin, clone, capsys):
+def test_dash_writes_the_config_and_prints_the_command(tmp_path, origin, clone, capsys):
     point_origin_at_github(clone)
     runner = FakeRunner(gh_replies())
-    cli.main(["--root", str(tmp_path / "code"), "--json"], runner=runner)
-    report = json.loads(capsys.readouterr().out)
-    target = dash.config_dir() / "config.yml"
-    assert report["gh_dash"] == {"path": str(target), "written": False, "existing_config": False}
-    assert not target.exists() and not target.parent.exists()
-    assert report["ghq_clones"] is None  # --root: exactly these roots, no ghq
-    assert not any(c[0] == "ghq" for c in runner.calls)
-
-
-def test_gh_dash_config_never_overwrites_yours(tmp_path, origin, clone, capsys):
-    point_origin_at_github(clone)
-    mine = dash.config_dir() / "config.yml"
-    mine.parent.mkdir(parents=True)
-    mine.write_text("prSections: []\n")
-    args = ["--root", str(tmp_path / "code"), "--apply", "--json"]
-    cli.main(args, runner=FakeRunner(gh_replies()))
-    report = json.loads(capsys.readouterr().out)
-    assert mine.read_text() == "prSections: []\n"
-    written = mine.with_name("config.syncghrepo.yml")
-    assert report["gh_dash"] == {"path": str(written), "written": True, "existing_config": True}
-    text = written.read_text()
+    assert cli.main(["dash"], runner=runner) == 0
+    config = dash.config_dir() / "config.yml"
+    assert capsys.readouterr().out == f"Wrote {local.short_path(config)}\ngh dash\n"
+    text = config.read_text()
     scope = " repo:benpshore/other repo:benpshore/proj"
     for title, filters in [*dash.PR_SECTIONS, *dash.ISSUE_SECTIONS]:
         assert f'  - title: "{title}"\n    filters: "{filters}{scope}"\n' in text
     assert f'repoPaths:\n  "benpshore/proj": "{local.short_path(clone.resolve())}"\n' in text
     assert text.endswith("defaults:\n  view: prs\n")
+    # Only discovery: no clone is inspected or synced, and gh dash is never started.
+    assert not {"fetch", "status", "push", "commit"} & set(runner.git_subcommands())
+    assert runner.git_sync_calls() == []
+    assert not any(c[:2] == ["gh", "dash"] for c in runner.calls)
 
 
-def test_ghq_clones_are_a_clone_source_without_root(tmp_path, origin, clone, monkeypatch, capsys):
-    monkeypatch.setenv("SYNCGHREPO_ROOTS", str(tmp_path / "code"))
+def test_dash_never_overwrites_your_config(tmp_path, origin, clone, capsys):
+    point_origin_at_github(clone)
+    mine = dash.config_dir() / "config.yml"
+    mine.parent.mkdir(parents=True)
+    mine.write_text("prSections: []\n")
+    assert cli.main(["dash", "--json"], runner=FakeRunner(gh_replies())) == 0
+    result = json.loads(capsys.readouterr().out)
+    assert mine.read_text() == "prSections: []\n"
+    written = mine.with_name("config.syncghrepo.yml")
+    assert result == {
+        "errors": [],
+        "path": str(written),
+        "written": True,
+        "existing_config": True,
+        "command": f"gh dash --config {local.short_path(written)}",
+    }
+    assert "My drafts" in written.read_text()
+
+
+def use_home(monkeypatch, tmp_path):
+    """No $SYNCGHREPO_ROOTS, so roots are ghq + ~/code, with ~ in tmp_path."""
+    monkeypatch.delenv("SYNCGHREPO_ROOTS")
+    monkeypatch.setenv("HOME", str(tmp_path))
+
+
+def test_ghq_clones_are_added_to_code_by_default(tmp_path, origin, clone, monkeypatch, capsys):
+    use_home(monkeypatch, tmp_path)
     managed = tmp_path / "ghq" / "github.com" / "benpshore" / "proj"
     git(tmp_path, "clone", "-q", str(origin.bare), str(managed))
     listing = f"{managed}\n{clone}\n{tmp_path / 'ghq' / 'gone'}\n"  # dupes and stale entries
-    runner = FakeRunner(ghq=Result(0, listing))
-    assert cli.main(["--no-github", "--json"], runner=runner) == 0
+    runner = FakeRunner(gh_replies(), ghq=Result(0, listing))
+    cli.main(["--json"], runner=runner)
     report = json.loads(capsys.readouterr().out)
+    assert report["roots"] == [str(tmp_path / "code")]
     assert report["ghq_clones"] == 2
     paths = sorted(c["path"] for r in report["repos"] for c in r["clones"])
     assert paths == sorted([str(managed.resolve()), str(clone.resolve())])
     assert ["ghq", "list", "-p"] in runner.calls
-    assert report["gh_dash"] is None  # no GitHub, no review config
+
+
+def test_roots_from_environment_replace_ghq_and_code(tmp_path, clone, capsys):
+    runner = FakeRunner(gh_replies(), ghq=Result(0, "/elsewhere/repo\n"))
+    cli.main(["--json"], runner=runner)
+    report = json.loads(capsys.readouterr().out)
+    assert report["roots"] == [str(tmp_path / "code")] and report["ghq_clones"] is None
+    assert not any(c[0] == "ghq" for c in runner.calls)
 
 
 def test_ghq_missing_or_failing(tmp_path, clone, monkeypatch, capsys):
-    monkeypatch.setenv("SYNCGHREPO_ROOTS", str(tmp_path / "code"))
-    missing = FakeRunner(ghq=Result(127, "", "ghq: No such file or directory"))
-    assert cli.main(["--no-github", "--json"], runner=missing) == 0
-    assert json.loads(capsys.readouterr().out)["ghq_clones"] is None
-    broken = FakeRunner(ghq=Result(1, "", "boom"))
-    assert cli.main(["--no-github", "--json"], runner=broken) == 1
+    use_home(monkeypatch, tmp_path)
+    missing = FakeRunner(gh_replies(), ghq=Result(127, "", "ghq: No such file or directory"))
+    cli.main(["--json"], runner=missing)
+    report = json.loads(capsys.readouterr().out)
+    assert report["ghq_clones"] is None and report["errors"] == []
+    broken = FakeRunner(gh_replies(), ghq=Result(1, "", "boom"))
+    assert cli.main(["--json"], runner=broken) == 2
     assert json.loads(capsys.readouterr().out)["errors"] == ["ghq list -p failed: boom"]
 
 
-def test_mode_flags():
-    assert cli.parse_args([]).apply is False
-    assert cli.parse_args(["--dry-run"]).apply is False
-    assert cli.parse_args(["--apply"]).apply is True
+def test_commands_and_the_only_flag():
+    assert cli.parse_args([]).command is None
+    assert cli.parse_args(["sync"]).command == "sync"
+    assert cli.parse_args(["dash", "--json"]).json is True
+    assert cli.parse_args(["--json", "sync"]).command == "sync"
 
 
-def test_dry_run_and_apply_are_exclusive(capsys):
-    try:
-        cli.main(["--dry-run", "--apply"])
-    except SystemExit as exit:
-        assert exit.code == 2
-    else:
-        raise AssertionError("expected a usage error")
+@pytest.mark.parametrize(
+    "argv",
+    [["apply"], ["--apply"], ["--dry-run"], ["--fetch"], ["--root", "/x"], ["--no-github"],
+     ["--git-sync", "/x"], ["--depth", "2"], ["--jobs", "1"], ["sync", "dash"]],
+)  # fmt: skip
+def test_old_flags_and_unknown_commands_are_usage_errors(argv, capsys):
+    with pytest.raises(SystemExit) as exit:
+        cli.parse_args(argv)
+    assert exit.value.code == 2
 
 
-def test_roots_from_environment(monkeypatch):
+def test_help_lists_the_commands_and_environment(capsys):
+    with pytest.raises(SystemExit):
+        cli.parse_args(["--help"])
+    out = capsys.readouterr().out
+    for text in ("syncghrepo sync", "syncghrepo dash", "SYNCGHREPO_ROOTS", "SYNCGHREPO_GIT_SYNC",
+                 "--json", "Exit status: 0"):  # fmt: skip
+        assert text in out
+
+
+def test_env_roots(monkeypatch):
     monkeypatch.setenv("SYNCGHREPO_ROOTS", "/a:/b")
-    assert cli.default_roots() == ["/a", "/b"]
+    assert cli.env_roots() == ["/a", "/b"]
     monkeypatch.delenv("SYNCGHREPO_ROOTS")
-    assert cli.default_roots() == ["~/code"]
+    assert cli.env_roots() == []

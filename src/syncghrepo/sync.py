@@ -202,7 +202,7 @@ def process(
         fast_forward_default(branch)
         return done()
     if not git_sync:
-        act("git-sync (skipped)", ok=False, note="git-sync not found; see --git-sync")
+        act("git-sync (skipped)", ok=False, note="git-sync not found; see $SYNCGHREPO_GIT_SYNC")
         return done()
     remote = git.out("config", f"branch.{branch}.remote")
     if upstream and not protected and upstream != f"{remote}/{branch}":

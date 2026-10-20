@@ -56,7 +56,7 @@ CLONE_STATUS = {"up-to-date", "updated", "would-update", "held-back", "conflict"
 
 
 def busy_report(tmp_path, origin, clone, capsys) -> dict:
-    """Run --apply --json on a clone with most kinds of unresolved work."""
+    """Run sync --json on a clone with most kinds of unresolved work."""
     point_origin_at_github(clone)
     old = "2020-01-01T00:00:00"
     git(clone, "switch", "-q", "-c", "old")
@@ -86,7 +86,7 @@ def busy_report(tmp_path, origin, clone, capsys) -> dict:
         ("search", "prs"): Result(0, ""),
         ("api", "graphql"): Result(0, payload),
     }
-    args = ["--root", str(tmp_path / "code"), "--apply", "--json"]
+    args = ["sync", "--json"]
     assert cli.main(args, runner=FakeRunner(replies)) == 1
     first = json.loads(capsys.readouterr().out)
     cli.main(args, runner=FakeRunner(replies))

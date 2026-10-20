@@ -15,7 +15,7 @@ GIT_SYNC = Path(__file__).parent / "fixtures" / "git-sync"
 
 
 @pytest.fixture(autouse=True)
-def isolated_git(tmp_path_factory, monkeypatch):
+def isolated_git(tmp_path_factory, tmp_path, monkeypatch):
     """Keep tests away from the user's global git config (signing, hooks, identity)."""
     cfg = tmp_path_factory.mktemp("gitcfg") / "gitconfig"
     cfg.write_text("[init]\n\tdefaultBranch = main\n[advice]\n\tmergeConflict = false\n")
@@ -23,6 +23,8 @@ def isolated_git(tmp_path_factory, monkeypatch):
     monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
     monkeypatch.setenv("SYNCGHREPO_GIT_SYNC", str(GIT_SYNC))
     monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path_factory.mktemp("xdg")))  # gh-dash config
+    # Roots are this test's code/ folder: never the user's ~/code, and no ghq.
+    monkeypatch.setenv("SYNCGHREPO_ROOTS", str(tmp_path / "code"))
     for role in ("AUTHOR", "COMMITTER"):
         monkeypatch.setenv(f"GIT_{role}_NAME", "Test User")
         monkeypatch.setenv(f"GIT_{role}_EMAIL", "test@example.com")
