@@ -4,7 +4,7 @@ Order: gh repo sync (forks) -> git fetch --prune -> auto-save WIP commit ->
 git pull --rebase --autostash (trivial conflicts resolved, else aborted) ->
 fast-forward the default branch if it is not checked out -> push.
 
-Never loses work: a backup ref (refs/syncghrepo/backup/...) is made before every
+Never loses work: a backup ref (refs/syncghrepo/backup/<ts>) is made before every
 rewrite, nothing is reset or discarded, and the only forced push is
 --force-with-lease on wip/ branches. With dry_run nothing is written: every step
 is listed as it would run, and conflicts are predicted in a scratch object store.
@@ -71,6 +71,12 @@ def process(
     if not info["head"]:
         return finish("skipped", f"no commits yet on {info['branch']}; left alone")
 
+    # 0. Secret check: a hit skips the whole clone (nothing saved, synced or pushed).
+    report["held_back"] = save.held_back(git, path)
+    if report["held_back"]:
+        files = ", ".join(h["path"] for h in report["held_back"][:5])
+        return finish("held-back", f"secret-looking or oversized files ({files}); clone skipped")
+
     # 1. Forks: bring the fork on GitHub up to date with its parent (never --force).
     if fork and can_push:
         cmd = f"gh repo sync {fork}"
@@ -84,10 +90,9 @@ def process(
     branch = info["branch"]
 
     # 3. Auto-save uncommitted work.
-    saving = save.plan(git, path, info, moment.strftime("%Y-%m-%d"))
+    saving = save.plan(git, path, info, moment.strftime("%Y%m%d"))
     new_commits = 0
     if saving:
-        report["held_back"] = saving["held_back"]
         report["save_skipped"] = saving["skipped"]
         if saving["files"] and not saving["skipped"]:
             target = saving["branch"]
@@ -115,7 +120,7 @@ def process(
     if upstream and behind:
         pull = "git pull --rebase --autostash"
         note = f"{behind} new commit(s) from {upstream}"
-        backup = f"{BACKUP_PREFIX}/{branch}/{moment.strftime('%Y%m%d-%H%M%S')}"
+        backup = f"{BACKUP_PREFIX}/{moment.strftime('%Y%m%dT%H%M%S')}"
         if dry_run:
             if ahead:
                 act(f"git update-ref {backup} HEAD", note="backup before rebase")
@@ -135,7 +140,7 @@ def process(
         else:
             existing = git.out(
                 "for-each-ref", "--points-at", "HEAD", "--format=%(refname)",
-                f"{BACKUP_PREFIX}/{branch}/",
+                f"{BACKUP_PREFIX}/",
             )  # fmt: skip
             if ahead and existing:  # an earlier run already backed up this exact commit
                 report["backup_refs"].append(existing.splitlines()[0])

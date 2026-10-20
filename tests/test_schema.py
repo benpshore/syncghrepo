@@ -69,7 +69,11 @@ def busy_report(tmp_path, origin, clone, capsys) -> dict:
     git(clone, "push", "-q", "-u", "origin", "feat")
     origin.advance("a.txt", "theirs\n", branch="feat")
     (clone / "a.txt").write_text("mine\n")
-    (clone / ".env").write_text("SECRET=***")
+    # A second clone with a secret: skipped as held-back.
+    other = tmp_path / "code" / "GitHub" / "proj-copy"
+    git(tmp_path, "clone", "-q", str(origin.bare), str(other))
+    point_origin_at_github(other)
+    (other / ".env").write_text("SECRET=1\n")
 
     issue = {"number": 4, "title": "Fix it", "url": "https://x/4", "updatedAt": "2026-10-01"}
     payload = status_payload("benpshore/proj", ci="FAILURE", prs=[pr(7, "dependabot"),
@@ -99,14 +103,17 @@ def test_json_schema_is_stable(tmp_path, origin, clone, capsys):
     assert set(repo["remote"]) == REMOTE
     assert all(set(p) == PR for p in repo["remote"]["prs"])
     assert all(set(i) == ISSUE for i in repo["remote"]["assigned_issues"])
-    (clone_out,) = repo["clones"]
-    assert set(clone_out) == CLONE
+    by_status = {c["status"]: c for c in repo["clones"]}
+    assert set(by_status) == {"conflict", "held-back"}
+    assert all(set(c) == CLONE for c in repo["clones"])
+    clone_out = by_status["conflict"]
+    held_out = by_status["held-back"]
     assert clone_out["status"] in CLONE_STATUS
     assert clone_out["branches"] and all(set(b) == BRANCH for b in clone_out["branches"])
     assert clone_out["stashes"] and all(set(s) == STASH for s in clone_out["stashes"])
     assert all(set(a) == ACTION for a in clone_out["actions"])
     assert set(clone_out["saved"]) == SAVED
-    assert clone_out["held_back"] and all(set(h) == HELD for h in clone_out["held_back"])
+    assert held_out["held_back"] and all(set(h) == HELD for h in held_out["held_back"])
     assert clone_out["conflicts"] and all(set(c) >= CONFLICT for c in clone_out["conflicts"])
 
     items = report["items"]

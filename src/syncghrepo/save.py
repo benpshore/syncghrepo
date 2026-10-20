@@ -1,10 +1,12 @@
 """Auto-save: commit uncommitted work as a WIP commit, never on the default branch.
 
-Never commits ignored files (git add skips them), secret-looking files, files that
-contain secret-looking strings, or very large files; those are held back and reported.
+Never commits ignored files (git add skips them). If any changed file is secret-looking
+(by name or content) or very large, the whole clone is skipped and the files reported:
+nothing is committed, synced or pushed there until a person looks.
 """
 
 import re
+import socket
 import stat
 import tempfile
 from pathlib import Path
@@ -74,10 +76,16 @@ def hold_reason(root: Path, rel: str) -> str | None:
     return None
 
 
-def wip_branch(git: Git, today: str) -> str:
-    """wip/<date>, or wip/<date>-N if that name is taken locally or on origin."""
+def host_tag() -> str:
+    """Short, branch-safe host name: Bens-MacBook-Pro.local -> bens-macbook-pro."""
+    name = socket.gethostname().split(".")[0].lower()
+    return re.sub(r"[^a-z0-9-]+", "-", name).strip("-") or "host"
+
+
+def wip_branch(git: Git, day: str) -> str:
+    """wip/<YYYYMMDD>-<host>, plus -N if that name is taken locally or on origin."""
     for n in range(1, 1000):
-        name = f"wip/{today}" + (f"-{n}" if n > 1 else "")
+        name = f"wip/{day}-{host_tag()}" + (f"-{n}" if n > 1 else "")
         taken = any(
             git("show-ref", "--quiet", "--verify", ref).ok
             for ref in (f"refs/heads/{name}", f"refs/remotes/origin/{name}")
@@ -87,8 +95,17 @@ def wip_branch(git: Git, today: str) -> str:
     raise RuntimeError("no free wip branch name")
 
 
-def plan(git: Git, root: Path, info: dict, today: str) -> dict | None:
-    """What auto-save would commit and where, or None if there is nothing to save."""
+def held_back(git: Git, root: Path) -> list[dict]:
+    """Changed files that must never be committed: secret-looking or too large."""
+    paths = changed_paths(git) or []
+    return [{"path": p, "reason": r} for p in paths if (r := hold_reason(root, p))]
+
+
+def plan(git: Git, root: Path, info: dict, day: str) -> dict | None:
+    """What auto-save would commit and where, or None if there is nothing to save.
+
+    Callers check held_back() first; a clone with held-back files is skipped.
+    """
     paths = changed_paths(git)
     if paths is None:
         return {"files": [], "held_back": [], "branch": None, "new_branch": False,
@@ -104,7 +121,7 @@ def plan(git: Git, root: Path, info: dict, today: str) -> dict | None:
     if len(files) > MAX_FILES:
         skipped = f"{len(files)} files changed (over {MAX_FILES}; missing .gitignore?)"
     elif files and new_branch:
-        branch = wip_branch(git, today)
+        branch = wip_branch(git, day)
     return {
         "files": files,
         "held_back": held,
