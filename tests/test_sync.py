@@ -1,6 +1,7 @@
 """End-to-end behaviour of one clone, against real git repos in tmp_path."""
 
 import hashlib
+import re
 from datetime import datetime
 
 import pytest
@@ -9,7 +10,7 @@ from conftest import FakeRunner, commit, fake_token, git, remote_head
 from syncghrepo import save, sync
 from syncghrepo.run import Result
 
-TODAY = datetime.now().astimezone().strftime("%Y-%m-%d")
+WIP = f"wip/{datetime.now().astimezone().strftime('%Y%m%d')}-{save.host_tag()}"
 # Anything that could lose work or rewrite published history. None of it may ever run.
 FORBIDDEN = ("reset", "clean", "checkout", "restore", "stash drop", "stash pop", "stash clear")
 
@@ -55,7 +56,8 @@ def test_work_on_main_moves_to_pushed_wip_branch(origin, clone):
 
     result, runner = apply(clone)
 
-    branch = f"wip/{TODAY}"
+    branch = WIP
+    assert re.fullmatch(r"wip/\d{8}-[a-z0-9-]+", branch)
     assert result["status"] == "updated", result["actions"]
     assert result["saved"]["branch"] == branch
     assert result["saved"]["files"] == ["a.txt", "new.txt"]
@@ -75,7 +77,7 @@ def test_second_wip_branch_the_same_day_gets_a_suffix(origin, clone):
     git(clone, "switch", "-q", "main")
     (clone / "a.txt").write_text("second\n")
     result, _ = apply(clone)
-    assert result["saved"]["branch"] == f"wip/{TODAY}-2"
+    assert result["saved"]["branch"] == f"{WIP}-2"
 
 
 def test_main_fast_forwards_while_on_wip_branch(origin, clone):
@@ -107,7 +109,7 @@ def test_local_only_branch_is_pushed_with_upstream(origin, clone):
     assert result["status"] == "updated"
 
 
-def test_secrets_ignored_and_prestaged_files_are_never_committed(origin, clone, monkeypatch):
+def test_secret_hit_skips_the_whole_clone(origin, clone, monkeypatch):
     monkeypatch.setattr(save, "MAX_FILE_BYTES", 1000)
     (clone / ".gitignore").write_text("*.log\n")
     (clone / "debug.log").write_text("ignored\n")
@@ -117,19 +119,33 @@ def test_secrets_ignored_and_prestaged_files_are_never_committed(origin, clone, 
     (clone / "big.bin").write_bytes(b"0" * 2000)
     (clone / "ok.py").write_text("print('hi')\n")
     (clone / "server.pem").write_text("cert\n")
-    git(clone, "add", "server.pem")  # staged by hand: must still stay out
+    git(clone, "add", "server.pem")  # staged by hand: still a hit
+    origin.advance()  # upstream moved, but the clone must not be touched at all
+    before = head(clone)
 
     result, runner = apply(clone)
 
+    held = {h["path"]: h["reason"] for h in result["held_back"]}
+    assert set(held) == {".env", "config.py", "big.bin", "server.pem"}  # not debug.log
+    assert held["config.py"] == "contains a secret-looking string"
+    assert fake_token() not in str(result)
+    assert result["status"] == "held-back" and "clone skipped" in result["note"]
+    assert result["saved"] is None and result["actions"] == []
+    assert head(clone) == before
+    assert not {"commit", "add", "fetch", "pull", "push", "switch"} & set(runner.git_subcommands())
+    assert (clone / ".env").exists() and (clone / "ok.py").exists()
+    assert_safe(runner)
+
+
+def test_clean_clone_without_secrets_still_commits_non_ignored_files(origin, clone):
+    (clone / ".gitignore").write_text("*.log\n")
+    (clone / "debug.log").write_text("ignored\n")
+    (clone / ".env.example").write_text("TOKEN=\n")
+    (clone / "ok.py").write_text("print('hi')\n")
+    result, _ = apply(clone)
     committed = git(clone, "show", "--name-only", "--format=", "HEAD").split()
     assert sorted(committed) == [".env.example", ".gitignore", "ok.py"]
-    held = {h["path"]: h["reason"] for h in result["held_back"]}
-    assert set(held) == {".env", "config.py", "big.bin", "server.pem"}
-    assert fake_token() not in str(result)
-    assert result["status"] == "held-back"
-    assert (clone / ".env").exists() and (clone / "debug.log").exists()
-    assert "A  server.pem" in git(clone, "status", "--porcelain")
-    assert_safe(runner)
+    assert result["status"] == "updated"
 
 
 def test_too_many_files_is_not_auto_saved(origin, clone, monkeypatch):
@@ -192,7 +208,7 @@ def test_trivial_conflicts_are_resolved_with_a_backup(origin, clone):
     assert git(clone, "merge-base", "--is-ancestor", "origin/feat", "HEAD") == ""
     assert remote_head(origin, "feat") == head(clone)
     (backup,) = result["backup_refs"]
-    assert backup.startswith("refs/syncghrepo/backup/feat/")
+    assert backup.startswith("refs/syncghrepo/backup/")
     assert head(clone, backup) == mine_before
     assert_safe(runner)
 
@@ -234,18 +250,29 @@ def test_dry_run_fetch_sees_new_upstream_commits(origin, clone):
     ]
 
 
-def test_held_back_tracked_change_survives_rebase_via_autostash(origin, clone):
+def test_secret_in_tracked_file_blocks_rebase_and_push(origin, clone):
     commit(clone, "settings.py", "TOKEN = ''\n")
     git(clone, "push", "-q", "origin", "main")
     diverge(origin, clone, {"b.txt": "upstream\n"}, {"c.txt": "mine\n"})
     (clone / "settings.py").write_text(f"TOKEN = '{fake_token()}'\n")
+    before = head(clone)
 
-    result, _ = apply(clone)
+    result, runner = apply(clone)
 
     assert result["status"] == "held-back"
-    assert (clone / "b.txt").exists() and (clone / "c.txt").exists()
+    assert head(clone) == before and not (clone / "b.txt").exists()
     assert fake_token() in (clone / "settings.py").read_text()
     assert result["stashes"] == []
+    assert "rebase" not in runner.git_subcommands()
+
+
+def test_dry_run_reports_the_secret_skip(origin, clone):
+    (clone / ".env").write_text("SECRET=1\n")
+    (clone / "a.txt").write_text("edited\n")
+    result = sync.process(FakeRunner(), clone, can_push=True, dry_run=True)
+    assert result["status"] == "held-back"
+    assert [h["path"] for h in result["held_back"]] == [".env"]
+    assert result["actions"] == []
 
 
 def test_dry_run_writes_nothing_and_shows_the_plan(origin, clone):
@@ -254,7 +281,6 @@ def test_dry_run_writes_nothing_and_shows_the_plan(origin, clone):
     diverge(origin, clone, {"uv.lock": "upstream\n", "a.txt": "theirs\n"}, {})
     (clone / "uv.lock").write_text("mine\n")
     (clone / "a.txt").write_text("ours\n")
-    (clone / ".env").write_text("SECRET=1\n")
 
     def fingerprint():
         files = sorted(p for p in (clone / ".git").rglob("*") if p.is_file())
@@ -274,11 +300,11 @@ def test_dry_run_writes_nothing_and_shows_the_plan(origin, clone):
     cmds = [a["cmd"] for a in result["actions"]]
     assert cmds[0] == "gh repo sync me/proj"
     assert "git commit 2 file(s) on feat" in cmds
-    assert any(c.startswith("git update-ref refs/syncghrepo/backup/feat/") for c in cmds)
+    assert any(c.startswith("git update-ref refs/syncghrepo/backup/") for c in cmds)
     assert "git pull --rebase --autostash" in cmds
     assert {r["path"]: r["how"] for r in result["resolved"]} == {"uv.lock": "lockfile"}
     assert [c["path"] for c in result["conflicts"]] == ["a.txt"]
-    assert [h["path"] for h in result["held_back"]] == [".env"]
+    assert result["held_back"] == []
     assert all(a["ok"] is None for a in result["actions"])
     assert not {"fetch", "pull", "push", "commit", "rebase", "switch"} & set(
         runner.git_subcommands()
@@ -291,16 +317,16 @@ def test_dry_run_on_main_plans_wip_branch_and_push(origin, clone):
     result = sync.process(FakeRunner(), clone, can_push=True, dry_run=True)
     cmds = [a["cmd"] for a in result["actions"]]
     assert cmds == [
-        f"git switch -c wip/{TODAY}",
-        f"git commit 1 file(s) on wip/{TODAY}",
-        f"git push -u origin HEAD:refs/heads/wip/{TODAY}",
+        f"git switch -c {WIP}",
+        f"git commit 1 file(s) on {WIP}",
+        f"git push -u origin HEAD:refs/heads/{WIP}",
     ]
     assert result["status"] == "would-update"
     assert git(clone, "branch", "--show-current") == "main"
 
 
 def test_wip_branch_rejected_push_retries_with_lease_only(origin, clone):
-    git(clone, "switch", "-q", "-c", f"wip/{TODAY}")
+    git(clone, "switch", "-q", "-c", WIP)
     git(clone, "push", "-q", "-u", "origin", "HEAD")
     commit(clone, "w.txt", "work\n")
     rejected = Result(1, "", "! [rejected] (fetch first)")
@@ -316,7 +342,7 @@ def test_wip_branch_rejected_push_retries_with_lease_only(origin, clone):
 
     pushes = [c for c in runner.git_commands() if c.startswith("push")]
     assert len(pushes) == 2 and "--force-with-lease=refs/heads/wip/" in pushes[1]
-    assert remote_head(origin, f"wip/{TODAY}") == head(clone)
+    assert remote_head(origin, WIP) == head(clone)
     assert result["status"] == "updated"
     assert_safe(runner)
 

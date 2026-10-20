@@ -4,10 +4,10 @@ from datetime import datetime
 from conftest import FakeRunner, git, remote_head
 from test_github import pr, repo_line, status_payload
 
-from syncghrepo import cli
+from syncghrepo import cli, save
 from syncghrepo.run import Result
 
-TODAY = datetime.now().astimezone().strftime("%Y-%m-%d")
+WIP = f"wip/{datetime.now().astimezone().strftime('%Y%m%d')}-{save.host_tag()}"
 
 
 def gh_replies(**permissions):
@@ -61,9 +61,7 @@ def test_default_is_a_dry_run_with_json(tmp_path, origin, clone, capsys):
     assert set(repos) == {"benpshore/proj", "benpshore/other", "plain"}
     proj = repos["benpshore/proj"]["clones"][0]
     assert proj["status"] == "would-update"
-    assert [a["cmd"] for a in proj["actions"]][
-        -1
-    ] == f"git push -u origin HEAD:refs/heads/wip/{TODAY}"
+    assert [a["cmd"] for a in proj["actions"]][-1] == f"git push -u origin HEAD:refs/heads/{WIP}"
     assert git(clone, "branch", "--show-current") == "main"
     assert git(clone, "diff", "--name-only") == "a.txt"  # still uncommitted
     assert git(clone, "diff", "--cached", "--name-only") == ""
@@ -93,7 +91,7 @@ def test_apply_saves_syncs_pushes_and_summarizes(tmp_path, origin, clone, capsys
     out = capsys.readouterr().out
     assert code == 0, out
     assert git(clone, "rev-parse", "main") == new_main
-    assert remote_head(origin, f"wip/{TODAY}") == git(clone, "rev-parse", "HEAD")
+    assert remote_head(origin, WIP) == git(clone, "rev-parse", "HEAD")
     assert "Clones: 1 updated" in out
     assert "Saved: 1 file(s), 0 held back" in out
     assert "Done:" in out and "ok git commit 1 file(s)" in out
@@ -123,7 +121,7 @@ def test_conflict_exits_1(tmp_path, origin, clone, capsys):
     out = capsys.readouterr().out
     assert code == 1
     assert "conflict needs a person: a.txt" in out
-    assert "backup: refs/syncghrepo/backup/feat/" in out
+    assert "backup: refs/syncghrepo/backup/" in out
 
 
 def test_someone_elses_clone_only_shows_my_prs(tmp_path, origin, clone, capsys):

@@ -2,8 +2,9 @@
 what is still open.
 
 For every clone under the roots: auto-save uncommitted work as a WIP commit
-(on a wip/<date> branch when on the default branch; secrets, .env, ignored and
-huge files are held back), gh repo sync forks, git pull --rebase --autostash
+(on a wip/<YYYYMMDD>-<host> branch when on the default branch; ignored files are
+never added, and a secret-looking, .env or huge file skips the whole clone),
+gh repo sync forks, git pull --rebase --autostash
 with trivial conflicts auto-resolved (anything else is aborted and reported),
 then push (never the default branch). Then report open PRs, review requests,
 failing CI, assigned issues, unpushed/stale branches and stashes.

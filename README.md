@@ -19,19 +19,22 @@ that the code imports only the standard library and has no dependencies.
 
 ## What it does, per clone
 
-1. **Auto-save.** Uncommitted changes become a WIP commit on the current branch.
-   Never on the default branch (or `main`/`master`): there the work moves to a new
-   `wip/<date>` branch first. Ignored files are never added. Secret-looking files
-   (`.env`, `.envrc`, keys, `credentials*`, databases, ...), files containing
-   secret-looking strings (GitHub/AWS/Slack/OpenAI/Google tokens, private keys)
-   and files over 50 MB are **held back** and reported. Over 2,000 changed files
-   (a missing `.gitignore`?) skips the save. Commit hooks are skipped (`--no-verify`).
+1. **Auto-save.** Uncommitted changes (tracked and new, non-ignored files) become a
+   WIP commit on the current branch. Never on the default branch (or `main`/`master`):
+   there the work moves to a new `wip/<YYYYMMDD>-<host>` branch first (`-2`, `-3`, ...
+   if taken). Ignored files are never added. **Secret check:** if any changed file
+   has a secret-looking name (`.env`, `.envrc`, keys, `credentials*`, databases,
+   ...), contains a secret-looking string (GitHub/AWS/Slack/OpenAI/Google tokens,
+   private keys) or is over 50 MB, the whole clone is skipped (nothing committed,
+   synced or pushed) and the files are reported. Over 2,000 changed files (a
+   missing `.gitignore`?) skips the save. Commit hooks are skipped (`--no-verify`).
 2. **Sync.** `gh repo sync owner/name` for forks you can push to (never `--force`),
    `git fetch --prune`, then `git pull --rebase --autostash`. If the default
    branch is not checked out, it is fast-forwarded with `git fetch . origin/main:main`
    (git refuses non-fast-forwards and checked-out branches).
 3. **Auto-clean conflicts.** Before any rebase that rewrites local commits, a backup
-   ref is made: `refs/syncghrepo/backup/<branch>/<time>`. Trivial conflicts are
+   ref is made: `refs/syncghrepo/backup/<YYYYMMDDTHHMMSS>` (reused if one already
+   points at the same commit). Trivial conflicts are
    resolved:
    - *identical*: both sides made the same change;
    - *whitespace*: the sides differ only in trailing whitespace, line endings or
@@ -90,7 +93,8 @@ error, a held-back file, or GitHub unreachable); 2 for bad arguments.
 
 The JSON report is documented below.
 
-To recover from a backup ref: `git switch -c rescue refs/syncghrepo/backup/<branch>/<time>`.
+To recover from a backup ref: `git switch -c rescue refs/syncghrepo/backup/<YYYYMMDDTHHMMSS>`
+(list them with `git for-each-ref refs/syncghrepo`).
 
 ## JSON schema
 
@@ -147,7 +151,7 @@ Every item has exactly these keys; absent values are `null` (`flags` is `[]`).
 | `conflict` | `path:branch` | pull aborted on conflicts that need a person; `detail` lists files and the backup ref |
 | `error` | `path:branch` | a step failed (see the clone's `actions`) |
 | `skipped` | `path:branch` | clone left alone: merge/rebase in progress, detached HEAD or no commits |
-| `held_back` | `path:file` | file not auto-saved (secret-looking or too large) |
+| `held_back` | `path:file` | secret-looking or oversized file; the whole clone was skipped |
 | `not_pushed` | `path:branch` | commits not pushed: default branch, deleted upstream or no push access |
 | `unpushed_branch` | `path:branch` | another local branch with commits on no remote |
 | `gone_branch` | `path:branch` | local branch whose upstream was deleted (merged?) |
