@@ -27,6 +27,9 @@ from pathlib import Path
 from . import github, local, sync
 from .run import Runner, make_runner
 
+# Bump when a field is removed or renamed, or its type or meaning changes; new fields
+# may be added without a bump (consumers ignore unknown keys). See README "JSON schema".
+SCHEMA_VERSION = 1
 PROBLEMS = ("conflict", "error", "held-back")
 FAILING_CI = ("failure", "error")
 INVOLVED = {"owner", "org", "collaborator"}  # else: only contributed to, or just cloned
@@ -121,7 +124,8 @@ def clone_items(clone: dict) -> list[str]:
     if stale:
         items.append(f"{len(stale)} stale branch(es): {', '.join(stale)}")
     if clone["stashes"]:
-        items.append(f"{len(clone['stashes'])} stash(es): {clone['stashes'][0]}")
+        first = clone["stashes"][0]
+        items.append(f"{len(clone['stashes'])} stash(es): {first['ref']}: {first['message']}")
     if clone["worktrees"]:
         paths = ", ".join(local.short_path(p) for p in clone["worktrees"])
         items.append(f"{len(clone['worktrees'])} other worktree(s), not auto-saved: {paths}")
@@ -155,6 +159,179 @@ def attention(entry: dict) -> list[str]:
         for issue in remote["assigned_issues"]:
             items.append(f"issue #{issue['number']} assigned to me: {issue['title']}")
     return items
+
+
+def item(kind: str, id_: str, repo: dict, title: str, **fields) -> dict:
+    """One unit of unresolved work. Every item has exactly these keys."""
+    return {
+        "id": f"{kind}:{id_}",
+        "kind": kind,
+        "repo": repo["name"],
+        "title": title,
+        "url": fields.get("url"),
+        "path": fields.get("path"),
+        "branch": fields.get("branch"),
+        "flags": fields.get("flags", []),
+        "updated_at": fields.get("updated_at"),
+        "detail": fields.get("detail"),
+    }
+
+
+def work_items(repos: list[dict]) -> list[dict]:
+    """A flat list of unresolved work with stable ids, for reconcile-tasks and agents.
+
+    An id is the same on every run while the work is the same, so a consumer can
+    match items across runs. Items are sorted by id.
+    """
+    items: list[dict] = []
+    for repo in repos:
+        name = repo["name"]
+        remote = repo.get("remote")
+        if repo.get("remote_error"):
+            items.append(
+                item("github_error", name, repo, "GitHub query failed", detail=repo["remote_error"])
+            )
+        if remote:
+            branch = remote["default_branch"]
+            if remote["ci"] in FAILING_CI and involved(repo):
+                items.append(
+                    item(
+                        "ci_failing",
+                        f"{name}@{branch}",
+                        repo,
+                        f"CI {remote['ci']} on {branch}",
+                        url=f"{remote['url']}/actions",
+                        branch=branch,
+                        detail=remote["ci_commit"],
+                    )
+                )
+            for pr in remote["prs"]:
+                flags = [
+                    flag
+                    for flag in ("mine", "draft", "needs_review", "review_requested")
+                    if pr[flag]
+                ]
+                items.append(
+                    item(
+                        "pr",
+                        f"{name}#{pr['number']}",
+                        repo,
+                        pr["title"],
+                        url=pr["url"],
+                        flags=flags,
+                        updated_at=pr["updated_at"],
+                        detail=f"by {pr['author']}",
+                    )
+                )
+            for issue in remote["assigned_issues"]:
+                items.append(
+                    item(
+                        "issue",
+                        f"{name}#{issue['number']}",
+                        repo,
+                        issue["title"],
+                        url=issue["url"],
+                        flags=["assigned"],
+                        updated_at=issue["updated_at"],
+                    )
+                )
+        for clone in repo["clones"]:
+            path, current = clone["path"], clone["branch"]
+            at = {"path": path, "branch": current}
+            if clone["status"] in ("skipped", "error", "conflict"):
+                files = [c["path"] for c in clone["conflicts"]]
+                detail = clone["note"] + (f"; files: {', '.join(files)}" if files else "")
+                if clone["backup_refs"]:
+                    detail += f"; backup: {', '.join(clone['backup_refs'])}"
+                items.append(
+                    item(
+                        clone["status"],
+                        f"{path}:{current}",
+                        repo,
+                        f"{clone['status']} in {local.short_path(path)}",
+                        detail=detail,
+                        **at,
+                    )
+                )
+            for held in clone["held_back"]:
+                items.append(
+                    item(
+                        "held_back",
+                        f"{path}:{held['path']}",
+                        repo,
+                        f"not saved: {held['path']}",
+                        detail=held["reason"],
+                        **at,
+                    )
+                )
+            for action in clone["actions"]:
+                if action["cmd"] == "git push (skipped)":
+                    items.append(
+                        item(
+                            "not_pushed",
+                            f"{path}:{current}",
+                            repo,
+                            f"{current} not pushed",
+                            detail=action["note"],
+                            **at,
+                        )
+                    )
+            for branch in clone["branches"]:
+                at_branch = {"path": path, "branch": branch["name"]}
+                if branch["unpushed"] and branch["name"] != current:
+                    items.append(
+                        item(
+                            "unpushed_branch",
+                            f"{path}:{branch['name']}",
+                            repo,
+                            f"{branch['name']}: {branch['unpushed']} unpushed commit(s)",
+                            **at_branch,
+                        )
+                    )
+                if branch["gone"]:
+                    items.append(
+                        item(
+                            "gone_branch",
+                            f"{path}:{branch['name']}",
+                            repo,
+                            f"{branch['name']}: upstream deleted",
+                            **at_branch,
+                        )
+                    )
+                if branch["stale"]:
+                    items.append(
+                        item(
+                            "stale_branch",
+                            f"{path}:{branch['name']}",
+                            repo,
+                            f"{branch['name']}: no commits for {branch['age_days']} days",
+                            **at_branch,
+                        )
+                    )
+            for stash in clone["stashes"]:
+                items.append(
+                    item(
+                        "stash",
+                        f"{path}:{stash['commit']}",
+                        repo,
+                        stash["message"],
+                        updated_at=stash["created"],
+                        detail=stash["ref"],
+                        **at,
+                    )
+                )
+            for tree in clone["worktrees"]:
+                items.append(
+                    item(
+                        "worktree",
+                        tree,
+                        repo,
+                        f"worktree {local.short_path(tree)}",
+                        path=tree,
+                        detail="linked worktree; not auto-saved",
+                    )
+                )
+    return sorted(items, key=lambda entry: entry["id"])
 
 
 def summarize(repos: list[dict]) -> dict:
@@ -290,14 +467,19 @@ def build_report(args: argparse.Namespace, runner: Runner, now: float | None = N
     for entry in ordered:
         entry["attention"] = attention(entry)
     ordered.sort(key=lambda entry: not entry["attention"])
+    items = work_items(ordered)
+    summary = summarize(ordered)
+    summary["items"] = dict(sorted(Counter(entry["kind"] for entry in items).items()))
     return {
+        "schema_version": SCHEMA_VERSION,
         "tool": "syncghrepo",
         "version": tool_version(),
         "generated_at": datetime.fromtimestamp(now, UTC).isoformat(timespec="seconds"),
         "user": me,
         "dry_run": not args.apply,
         "roots": [str(root) for root in roots],
-        "summary": summarize(ordered),
+        "summary": summary,
+        "items": items,
         "repos": ordered,
         "errors": errors,
     }

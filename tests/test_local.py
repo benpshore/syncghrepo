@@ -79,7 +79,9 @@ def test_inspect_reports_branches_stashes_and_worktrees(tmp_path, origin, clone)
     assert branches["wip"]["unpushed"] == 1 and branches["wip"]["upstream"] is None
     assert branches["old"]["stale"] and not branches["old"]["unpushed"]
     assert branches["merged"]["gone"] and branches["merged"]["unpushed"] == 1
-    assert len(result["stashes"]) == 1 and "half done" in result["stashes"][0]
+    (stash,) = result["stashes"]
+    assert stash["ref"] == "stash@{0}" and "half done" in stash["message"]
+    assert len(stash["commit"]) == 40 and stash["created"].startswith("20")
     assert [p.endswith("wt") for p in result["worktrees"]] == [True]
     assert result["default_branch"] == "main"
     assert result["changes"] == 0 and result["upstream_gone"] is False
