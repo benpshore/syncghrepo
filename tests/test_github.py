@@ -21,7 +21,9 @@ def repo_line(name, *, fork=False, archived=False, owner_type="User"):
     )
 
 
-def status_payload(name="benpshore/proj", *, ci="SUCCESS", prs=(), issues=(), fork=False):
+def status_payload(
+    name="benpshore/proj", *, ci="SUCCESS", prs=(), issues=(), fork=False, permission="ADMIN"
+):
     return json.dumps(
         {
             "data": {
@@ -30,6 +32,7 @@ def status_payload(name="benpshore/proj", *, ci="SUCCESS", prs=(), issues=(), fo
                     "url": f"https://github.com/{name}",
                     "isFork": fork,
                     "isArchived": False,
+                    "viewerPermission": permission,
                     "parent": {"nameWithOwner": "up/proj"} if fork else None,
                     "defaultBranchRef": {
                         "name": "main",
@@ -139,3 +142,14 @@ def test_repo_status_raises_on_gh_failure():
     runner = FakeRunner({("api", "graphql"): Result(1, "", "Could not resolve to a Repository")})
     with pytest.raises(github.GhError, match="Could not resolve"):
         github.repo_status(runner, "benpshore/gone", "benpshore")
+
+
+@pytest.mark.parametrize(
+    ("permission", "can_push"),
+    [("ADMIN", True), ("MAINTAIN", True), ("WRITE", True), ("TRIAGE", False), ("READ", False),
+     (None, False)],
+)  # fmt: skip
+def test_push_access_comes_from_viewer_permission(permission, can_push):
+    payload = status_payload(permission=permission)
+    runner = FakeRunner({("api", "graphql"): Result(0, payload)})
+    assert github.repo_status(runner, "benpshore/proj", "benpshore")["can_push"] is can_push
