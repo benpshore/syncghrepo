@@ -1,13 +1,14 @@
 """syncghrepo: keep all work in your local clones saved and in sync, and list
 what is still open.
 
-For every clone under the roots: a secret-looking, .env or huge changed file skips
-the clone; otherwise git-sync (simonthum/git-sync) commits, rebases and pushes the
-current branch, which syncghrepo opts in. Work on the default branch first moves
-to wip/<YYYYMMDD>-<host>; the default branch is only fast-forwarded. A backup ref
-is made before any rebase; trivial conflicts are resolved, anything else aborted.
-Forks get gh repo sync. Then report open PRs, review requests, failing CI,
-assigned issues, unpushed/stale branches and stashes.
+For every clone under the roots and in ghq (ghq list -p): a secret-looking,
+.env or huge changed file skips the clone; otherwise git-sync (simonthum/git-sync)
+commits, rebases and pushes the current branch, which syncghrepo opts in. Work on
+the default branch first moves to wip/<YYYYMMDD>-<host>; the default branch is
+only fast-forwarded. A backup ref is made before any rebase; trivial conflicts
+are resolved, anything else aborted. Forks get gh repo sync. Then report open
+PRs, review requests, failing CI, assigned issues, unpushed/stale branches and
+stashes, and (with --apply) write a gh-dash config to review them in gh dash.
 
 Dry run by default: nothing is written until you pass --apply.
 
@@ -25,7 +26,7 @@ from datetime import UTC, datetime
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 
-from . import github, gitsync, local, sync
+from . import dash, github, gitsync, local, sync
 from .run import Runner, make_runner
 
 # Bump when a field is removed or renamed, or its type or meaning changes; new fields
@@ -409,8 +410,18 @@ def build_report(args: argparse.Namespace, runner: Runner, now: float | None = N
             repos, found_errors = github.discover(runner, me)
             errors += found_errors
 
+    clone_paths = local.find_clones(roots, args.depth)
+    ghq_count = None
+    if not args.root:  # --root means exactly these; otherwise ghq's clones are added
+        found, ghq_error = local.ghq_clones(runner)
+        if ghq_error:
+            errors.append(ghq_error)
+        if found is not None:
+            ghq_count = len(found)
+            clone_paths = sorted(set(clone_paths) | set(found))
+
     clone_keys: list[tuple[Path, str]] = []
-    for path in local.find_clones(roots, args.depth):
+    for path in clone_paths:
         name, url = origin_name(runner, path)
         if name:
             key = name.lower()
@@ -480,14 +491,23 @@ def build_report(args: argparse.Namespace, runner: Runner, now: float | None = N
     items = work_items(ordered)
     summary = summarize(ordered)
     summary["items"] = dict(sorted(Counter(entry["kind"] for entry in items).items()))
+    generated_at = datetime.fromtimestamp(now, UTC).isoformat(timespec="seconds")
+    gh_dash = None
+    if me:
+        try:
+            gh_dash = dash.save(ordered, generated_at, tool_version(), write=args.apply)
+        except OSError as err:
+            errors.append(f"could not write the gh-dash config: {err}")
     return {
         "schema_version": SCHEMA_VERSION,
         "tool": "syncghrepo",
         "version": tool_version(),
-        "generated_at": datetime.fromtimestamp(now, UTC).isoformat(timespec="seconds"),
+        "generated_at": generated_at,
         "user": me,
         "dry_run": not args.apply,
         "roots": [str(root) for root in roots],
+        "ghq_clones": ghq_count,
+        "gh_dash": gh_dash,
         "summary": summary,
         "items": items,
         "repos": ordered,
@@ -504,8 +524,9 @@ def render(report: dict) -> str:
     lines = [
         f"syncghrepo {report['version']} · {report['user'] or 'no GitHub'} · "
         f"{report['generated_at']} · {mode}",
-        f"{s['repos']} repos ({s['on_github']} on GitHub), {s['clones']} clone(s) under {roots}, "
-        f"{s['not_cloned']} not cloned",
+        f"{s['repos']} repos ({s['on_github']} on GitHub), {s['clones']} clone(s) under {roots}"
+        + (f" and in ghq ({report['ghq_clones']})" if report["ghq_clones"] is not None else "")
+        + f", {s['not_cloned']} not cloned",
         f"Clones: {statuses}",
         f"Saved: {s['saved_files']} file(s), {s['held_back_files']} held back; "
         f"conflicts: {s['auto_resolved']} auto-resolved, {s['conflicts']} need a person",
@@ -553,6 +574,11 @@ def render(report: dict) -> str:
     ]
     if missing:
         lines += ["", f"Not cloned, nothing open ({len(missing)}): {', '.join(missing)}"]
+    if report["gh_dash"]:
+        where = local.short_path(report["gh_dash"]["path"])
+        flag = "" if where.endswith("/config.yml") else f" --config {where}"
+        done = "Wrote" if report["gh_dash"]["written"] else "Would write (--apply)"
+        lines += ["", f"gh-dash config: {done} {where}; review with: gh dash{flag}"]
     if report["errors"]:
         lines += ["", "Errors:"] + [f"  - {error}" for error in report["errors"]]
     return "\n".join(lines)
