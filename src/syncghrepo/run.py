@@ -1,4 +1,9 @@
-"""Run commands with a timeout. Every git, gh and lockfile command goes through a Runner."""
+"""Run commands with a timeout. Every git, gh and lockfile command goes through a Runner.
+
+syncghrepo makes no AI/LLM calls and no network calls of its own: it is plain git,
+gh and the standard library. run() enforces that with an allowlist, so nothing
+else (e.g. `gh models`, `gh copilot`, curl, an AI CLI) can ever be started.
+"""
 
 import os
 import signal
@@ -13,6 +18,25 @@ QUIET = {
     "GH_PROMPT_DISABLED": "1",
     "GH_NO_UPDATE_NOTIFIER": "1",
 }
+
+
+# The only commands syncghrepo may run (matched as argument prefixes).
+ALLOWED = (
+    ("git",),
+    ("gh", "api"),  # user, user/repos and the fixed GraphQL query in github.py
+    ("gh", "search", "prs"),
+    ("gh", "repo", "sync"),
+    # Lockfile regeneration for conflicts (resolve.LOCKFILES).
+    ("uv", "lock"),
+    ("cargo", "update", "--workspace"),
+    ("npm", "install", "--package-lock-only"),
+    ("pnpm", "install", "--lockfile-only"),
+    ("bundle", "lock"),
+)
+
+
+def allowed(cmd: Sequence[str]) -> bool:
+    return any(tuple(cmd[: len(prefix)]) == prefix for prefix in ALLOWED)
 
 
 @dataclass(frozen=True)
@@ -44,7 +68,9 @@ def run(
     timeout: float = 60.0,
     env: Mapping[str, str] | None = None,
 ) -> Result:
-    """Run cmd; on timeout kill its whole process group."""
+    """Run cmd; on timeout kill its whole process group. Refuses commands not in ALLOWED."""
+    if not allowed(cmd):
+        return Result(126, "", f"refused: {' '.join(cmd[:3])} is not an allowed command")
     try:
         proc = subprocess.Popen(
             list(cmd),
