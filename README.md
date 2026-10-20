@@ -9,6 +9,12 @@ Pipeline: `makeghrepo` (create repos) → **`syncghrepo`** (save, sync, list ope
 work) → `reconcile-tasks` (turn that work into tasks). The only contract between
 syncghrepo and reconcile-tasks is the versioned `--json` report below.
 
+**No AI.** syncghrepo makes no AI/LLM calls and has no network code of its own:
+only `git`, `gh` (`api`, `search prs`, `repo sync`), the lockfile tools listed below,
+and the Python standard library. `run.ALLOWED` enforces this: any other command
+(`gh models`, `gh copilot`, `curl`, an AI CLI, ...) is refused, and tests check
+that the code imports only the standard library and has no dependencies.
+
 **Dry run by default.** Nothing is written until you pass `--apply`.
 
 ## What it does, per clone
