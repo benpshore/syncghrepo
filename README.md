@@ -368,3 +368,13 @@ sqlite3 -bail :memory: ".read sqlite/schema.sql"   # the app opens ${APP_DATA:-.
 The owner (`benpshore`) may push their own work directly to `main` without a PR or passing CI. CI still runs after a push; releases retain their CI gates. Force-push, deletion, and merge commits remain blocked for everyone.
 
 Other accounts must use a squash PR with passing, up-to-date `ci`. Agents must use PRs and CI even when authenticated as the owner (see `AGENTS.md`). GitHub checks the pushing account, so enforcing a human/agent boundary requires separate credentials.
+
+### Qualification of automatic cloning and nested synchronization
+
+See [PR #11 qualification](docs/pr11-qualification.md) for reproduced failure cases,
+regression coverage, and limits. Automatic cloning includes archived repositories.
+Discovery is bounded by the depth and directory exclusions above; it cannot establish
+that a repository has no clone elsewhere on a machine. Local enumeration or submodule
+status errors suppress automatic cloning. Overlapping roots are synchronized parent
+first, and recursive submodule updates check every initialized descendant for local
+work before proceeding. Use `--dry-run` to inspect the plan on each machine.
