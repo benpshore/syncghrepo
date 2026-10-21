@@ -28,7 +28,7 @@ def blockers(runner: Runner, path: Path, entries: list[tuple[str, str]]) -> list
         git = Git(runner, path / rel)
         branch_result = git("symbolic-ref", "--quiet", "--short", "HEAD")
         branch = branch_result.out.strip() if branch_result.ok else None
-        status = git("status", "--porcelain")
+        status = git("status", "--porcelain", "--untracked-files=all", "--ignore-submodules=none")
         unpushed = git.out("rev-list", "--count", "HEAD", "--not", "--remotes")
         if branch_result.code not in (0, 1) or not status.ok:
             found.append(f"{rel} (could not inspect local work)")

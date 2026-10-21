@@ -63,7 +63,7 @@ def find_clones(
                     and child.name not in SKIP_DIRS
                 ]
             except OSError as err:
-                if errors is not None and not isinstance(err, FileNotFoundError):
+                if errors is not None and not (depth == 0 and isinstance(err, FileNotFoundError)):
                     errors.append(f"local discovery {folder}: {err}")
                 continue
             stack.extend((child, depth + 1) for child in children)
