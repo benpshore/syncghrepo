@@ -16,7 +16,11 @@ IN_PROGRESS = {
     "REVERT_HEAD": "revert",
     "BISECT_LOG": "bisect",
 }
-GITHUB_URL = re.compile(r"github\.com[:/]+([\w.-]+)/([\w.-]+?)(?:\.git)?/*$", re.IGNORECASE)
+GITHUB_URL = re.compile(
+    r"^(?:(?:https?|git|ssh)://(?:[^/@]+@)?github\.com/|(?:[^/@:]+@)?github\.com:)"
+    r"([\w.-]+)/([\w.-]+?)(?:\.git)?/*$",
+    re.IGNORECASE,
+)
 BRANCH_FORMAT = (
     "%(refname:short)%09%(upstream:short)%09%(upstream:track,nobracket)%09%(committerdate:unix)"
 )
@@ -30,7 +34,9 @@ def github_name(url: str | None) -> str | None:
     return f"{match[1]}/{match[2]}" if match else None
 
 
-def find_clones(roots: list[Path], max_depth: int = 3) -> list[Path]:
+def find_clones(
+    roots: list[Path], max_depth: int = 3, *, errors: list[str] | None = None
+) -> list[Path]:
     """Git clones under roots (a root may itself be a clone), at most max_depth down.
 
     Linked worktrees and submodules (where .git is a file) are skipped; they are
@@ -56,7 +62,9 @@ def find_clones(roots: list[Path], max_depth: int = 3) -> list[Path]:
                     and not child.name.startswith(".")
                     and child.name not in SKIP_DIRS
                 ]
-            except OSError:
+            except OSError as err:
+                if errors is not None and not isinstance(err, FileNotFoundError):
+                    errors.append(f"local discovery {folder}: {err}")
                 continue
             stack.extend((child, depth + 1) for child in children)
     return sorted(found)
@@ -65,7 +73,7 @@ def find_clones(roots: list[Path], max_depth: int = 3) -> list[Path]:
 NESTED_DEPTH = 4  # how deep to search inside a clone for nested repos
 
 
-def visible_dirs(folder: Path) -> list[Path]:
+def visible_dirs(folder: Path, errors: list[str] | None = None) -> list[Path]:
     """Subfolders worth searching: not hidden, not a symlink, not a build folder."""
     try:
         return [
@@ -76,7 +84,9 @@ def visible_dirs(folder: Path) -> list[Path]:
             and not child.name.startswith(".")
             and child.name not in SKIP_DIRS
         ]
-    except OSError:
+    except OSError as err:
+        if errors is not None:
+            errors.append(f"nested discovery {folder}: {err}")
         return []
 
 
@@ -96,10 +106,18 @@ def submodule_status(runner: Runner, path: Path) -> list[tuple[str, str]] | None
         match = SUBMODULE_LINE.match(line)
         if match:
             entries.append((match[1], match[2]))
+        elif line.strip():
+            return None
     return entries
 
 
-def nested_repos(runner: Runner, parents: list[Path], max_depth: int = NESTED_DEPTH) -> list[dict]:
+def nested_repos(
+    runner: Runner,
+    parents: list[Path],
+    max_depth: int = NESTED_DEPTH,
+    *,
+    errors: list[str] | None = None,
+) -> list[dict]:
     """Git repos inside the given clones: nested clones (their own .git folder) and
     initialized submodules, as {path, parent, submodule}, sorted by path.
 
@@ -115,12 +133,15 @@ def nested_repos(runner: Runner, parents: list[Path], max_depth: int = NESTED_DE
         stack = [(parent, 0)]
         while stack:
             folder, depth = stack.pop()
-            for child in visible_dirs(folder):
+            for child in visible_dirs(folder, errors):
                 if (child / ".git").exists():
                     candidates.append(child)
                 if depth + 1 < max_depth:
                     stack.append((child, depth + 1))
-        for state, rel in submodule_status(runner, parent) or []:
+        entries = submodule_status(runner, parent)
+        if entries is None and errors is not None:
+            errors.append(f"submodule discovery {parent}: git submodule status failed")
+        for state, rel in entries or []:
             if state != "-":
                 candidates.append(parent / rel)
         for candidate in candidates:

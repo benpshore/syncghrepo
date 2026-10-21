@@ -23,14 +23,20 @@ def blockers(runner: Runner, path: Path, entries: list[tuple[str, str]]) -> list
         if state == "U":
             found.append(f"{rel} (merge conflict)")
             continue
-        if state != "+":
+        if state == "-":
             continue
         git = Git(runner, path / rel)
-        branch = git.out("symbolic-ref", "--quiet", "--short", "HEAD")
+        branch_result = git("symbolic-ref", "--quiet", "--short", "HEAD")
+        branch = branch_result.out.strip() if branch_result.ok else None
+        status = git("status", "--porcelain")
         unpushed = git.out("rev-list", "--count", "HEAD", "--not", "--remotes")
-        if branch:
+        if branch_result.code not in (0, 1) or not status.ok:
+            found.append(f"{rel} (could not inspect local work)")
+        elif local.busy(git):
+            found.append(f"{rel} (git operation in progress)")
+        elif branch:
             found.append(f"{rel} (on branch {branch})")
-        elif git.out("status", "--porcelain"):
+        elif status.out.strip():
             found.append(f"{rel} (uncommitted changes)")
         elif unpushed != "0":
             found.append(f"{rel} (commits on no remote)")
