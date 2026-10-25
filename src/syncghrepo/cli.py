@@ -490,7 +490,8 @@ def discover(runner: Runner) -> dict:
         errors += found_errors
         listed = not any(error.startswith("listing repos") for error in found_errors)
 
-    clone_paths = local.find_clones(roots, DEPTH)
+    local_errors: list[str] = []
+    clone_paths = local.find_clones(roots, DEPTH, errors=local_errors)
     ghq_count = None
     ghq_error = None
     if not explicit:  # $SYNCGHREPO_ROOTS means exactly these; otherwise ghq's clones too
@@ -502,11 +503,13 @@ def discover(runner: Runner) -> dict:
             clone_paths = sorted(set(clone_paths) | set(found))
 
     clone_keys = [(path, register(runner, repos, path)) for path in clone_paths]
-    found_nested = local.nested_repos(runner, clone_paths)
+    found_nested = local.nested_repos(runner, clone_paths, errors=local_errors)
+    errors += local_errors
     nested_keys = [(info, register(runner, repos, info["path"])) for info in found_nested]
     return {"roots": roots, "errors": errors, "me": me, "repos": repos,
             "clone_keys": clone_keys, "nested_keys": nested_keys, "ghq_clones": ghq_count,
-            "complete": bool(me) and listed and not explicit and not ghq_error}  # fmt: skip
+            "complete": bool(me) and listed and not explicit and not ghq_error
+                        and not local_errors}  # fmt: skip
 
 
 def finish_report(
@@ -610,9 +613,20 @@ def build_report(args: argparse.Namespace, runner: Runner, now: float | None = N
         # GitHub first: push access and fork status decide what each clone may do.
         fetch_status(pool, runner, repos, list(repos), me)
 
-        jobs = [(key, pool.submit(run_clone, path, key)) for path, key in clone_keys]
-        for key, job in jobs:
-            repos[key]["clones"].append(job.result())
+        # Explicit roots and ghq can include both a parent and its child.
+        # Keep those in separate batches too, not just discovered nested clones.
+        levels = {
+            path: sum(path != other and path.is_relative_to(other) for other, _ in clone_keys)
+            for path, _ in clone_keys
+        }
+        for level in sorted(set(levels.values())):
+            jobs = [
+                (key, pool.submit(run_clone, path, key))
+                for path, key in clone_keys
+                if levels[path] == level
+            ]
+            for key, job in jobs:
+                repos[key]["clones"].append(job.result())
 
         # Nested repos, after their parents (whose submodule update may add some),
         # level by level so a repo and one inside it are never processed at once.
